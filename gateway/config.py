@@ -757,6 +757,15 @@ def load_gateway_config() -> GatewayConfig:
                 if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
                     os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
 
+            # Feishu settings → env vars (env vars take precedence)
+            feishu_cfg = yaml_cfg.get("feishu", {})
+            if isinstance(feishu_cfg, dict):
+                frc = feishu_cfg.get("free_response_chats")
+                if frc is not None and not os.getenv("FEISHU_FREE_RESPONSE_CHATS"):
+                    if isinstance(frc, list):
+                        frc = ",".join(str(v) for v in frc)
+                    os.environ["FEISHU_FREE_RESPONSE_CHATS"] = str(frc)
+
     except Exception as e:
         logger.warning(
             "Failed to process config.yaml — falling back to .env / gateway.json values. "
@@ -1130,6 +1139,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 chat_id=feishu_home,
                 name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
             )
+        feishu_free_response = os.getenv("FEISHU_FREE_RESPONSE_CHATS", "")
+        if feishu_free_response:
+            config.platforms[Platform.FEISHU].extra["free_response_chats"] = feishu_free_response
 
     # WeCom (Enterprise WeChat)
     wecom_bot_id = os.getenv("WECOM_BOT_ID")
