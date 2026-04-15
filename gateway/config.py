@@ -1147,6 +1147,11 @@ def load_gateway_config() -> GatewayConfig:
             if isinstance(feishu_cfg, dict):
                 if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
                     os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+                frc = feishu_cfg.get("free_response_chats")
+                if frc is not None and not os.getenv("FEISHU_FREE_RESPONSE_CHATS"):
+                    if isinstance(frc, list):
+                        frc = ",".join(str(v) for v in frc)
+                    os.environ["FEISHU_FREE_RESPONSE_CHATS"] = str(frc)
 
     except Exception as e:
         logger.warning(
@@ -1614,6 +1619,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
                 thread_id=os.getenv("FEISHU_HOME_CHANNEL_THREAD_ID") or None,
             )
+        feishu_free_response = os.getenv("FEISHU_FREE_RESPONSE_CHATS", "")
+        if feishu_free_response:
+            config.platforms[Platform.FEISHU].extra["free_response_chats"] = feishu_free_response
 
     # WeCom (Enterprise WeChat)
     wecom_bot_id = os.getenv("WECOM_BOT_ID")

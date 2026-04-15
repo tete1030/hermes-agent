@@ -4026,6 +4026,15 @@ class FeishuAdapter(BasePlatformAdapter):
 
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
+    def _feishu_free_response_chats(self) -> set[str]:
+        """Return the set of chat_ids where the bot responds without @mention."""
+        raw = self.config.extra.get("free_response_chats")
+        if raw is None:
+            raw = os.getenv("FEISHU_FREE_RESPONSE_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
@@ -4043,6 +4052,19 @@ class FeishuAdapter(BasePlatformAdapter):
             bot=self._bot_identity(),
         )
         return self._post_mentions_bot(normalized.mentions)
+
+    def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
+        """Require an explicit @mention before group messages enter the agent.
+
+        Exceptions:
+        - Chat is in free_response_chats (no @mention required)
+        - @_all is present (Feishu's @everyone placeholder)
+        """
+        if not self._allow_group_message(sender_id, chat_id):
+            return False
+        if chat_id and chat_id in self._feishu_free_response_chats():
+            return True
+        return self._mentions_self(message)
 
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
         # IDs trump names: when both sides have open_id (or both user_id),
