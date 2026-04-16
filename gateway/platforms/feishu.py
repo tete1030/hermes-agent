@@ -4330,9 +4330,18 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         effective_reply_to = reply_to
         if not effective_reply_to and metadata and metadata.get("thread_id"):
-            effective_reply_to = metadata.get("reply_to_message_id")
+            effective_reply_to = (
+                metadata.get("reply_to_message_id")
+                or metadata.get("root_message_id")
+            )
         reply_in_thread = bool((metadata or {}).get("thread_id"))
         if effective_reply_to:
+            logger.debug(
+                "[Feishu] Sending reply to %s in chat %s (reply_in_thread=%s)",
+                effective_reply_to,
+                chat_id,
+                reply_in_thread,
+            )
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
