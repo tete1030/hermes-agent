@@ -3845,6 +3845,7 @@ class GatewayRunner:
                             await _stt_adapter.send(
                                 source.chat_id,
                                 _stt_msg,
+                                reply_to=event.message_id,
                                 metadata=_stt_meta,
                             )
                         except Exception:
@@ -3917,9 +3918,12 @@ class GatewayRunner:
                 if _ctx_result.blocked:
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
+                        _ctx_meta = {"thread_id": source.thread_id} if source.thread_id else None
                         await _adapter.send(
                             source.chat_id,
                             "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                            reply_to=event.message_id,
+                            metadata=_ctx_meta,
                         )
                     return None
                 if _ctx_result.expanded:
