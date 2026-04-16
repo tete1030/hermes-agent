@@ -2138,6 +2138,7 @@ class BasePlatformAdapter(ABC):
                         await self.play_tts(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
+                            reply_to=event.message_id,
                             metadata=_thread_metadata,
                         )
                     finally:
@@ -2179,6 +2180,7 @@ class BasePlatformAdapter(ABC):
                                 chat_id=event.source.chat_id,
                                 animation_url=image_url,
                                 caption=alt_text if alt_text else None,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                         else:
@@ -2186,6 +2188,7 @@ class BasePlatformAdapter(ABC):
                                 chat_id=event.source.chat_id,
                                 image_url=image_url,
                                 caption=alt_text if alt_text else None,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                         if not img_result.success:
@@ -2207,24 +2210,28 @@ class BasePlatformAdapter(ABC):
                             media_result = await self.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                         elif ext in _VIDEO_EXTS:
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                         elif ext in _IMAGE_EXTS:
                             media_result = await self.send_image_file(
                                 chat_id=event.source.chat_id,
                                 image_path=media_path,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                         else:
                             media_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
 
@@ -2243,18 +2250,21 @@ class BasePlatformAdapter(ABC):
                             await self.send_image_file(
                                 chat_id=event.source.chat_id,
                                 image_path=file_path,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                         elif ext in _VIDEO_EXTS:
                             await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                         else:
                             await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
+                                reply_to=event.message_id,
                                 metadata=_thread_metadata,
                             )
                     except Exception as file_err:
