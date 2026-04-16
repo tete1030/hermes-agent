@@ -83,11 +83,13 @@ class GatewayStreamConsumer:
         chat_id: str,
         config: Optional[StreamConsumerConfig] = None,
         metadata: Optional[dict] = None,
+        initial_reply_to: Optional[str] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
+        self._initial_reply_to = initial_reply_to  # First message should reply to this
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
@@ -329,7 +331,7 @@ class GatewayStreamConsumer:
                             self._accumulated, _safe_limit
                         )
                         for chunk in chunks:
-                            await self._send_new_chunk(chunk, self._message_id)
+                            await self._send_new_chunk(chunk, self._message_id or self._initial_reply_to)
                         self._accumulated = ""
                         self._last_sent_text = ""
                         self._last_edit_time = time.monotonic()
@@ -613,6 +615,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
+                    reply_to=self._message_id or self._initial_reply_to,
                     metadata=self.metadata,
                 )
                 if result.success:
@@ -722,6 +725,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
+                reply_to=self._message_id or self._initial_reply_to,
                 metadata=self.metadata,
             )
             # Note: do NOT set _already_sent = True here.
@@ -847,6 +851,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
+                    reply_to=self._initial_reply_to,
                     metadata=self.metadata,
                 )
                 if result.success:
