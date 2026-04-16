@@ -3664,7 +3664,17 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+        
+        # If no reply_to but we have root_message_id in metadata, use it
+        # This ensures messages are sent in the thread even when reply_to wasn't explicitly passed
+        if not reply_to and metadata:
+            reply_to = metadata.get("root_message_id")
+        
         if reply_to:
+            logger.debug(
+                "[Feishu] Sending reply to %s in chat %s (reply_in_thread=%s)",
+                reply_to, chat_id, reply_in_thread,
+            )
             body = self._build_reply_message_body(
                 content=payload,
                 msg_type=msg_type,
@@ -3674,6 +3684,10 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(reply_to, body)
             return await asyncio.to_thread(self._client.im.v1.message.reply, request)
 
+        logger.debug(
+            "[Feishu] Sending new message to chat %s (no reply_to, thread_id=%s)",
+            chat_id, (metadata or {}).get("thread_id"),
+        )
         body = self._build_create_message_body(
             receive_id=chat_id,
             msg_type=msg_type,
