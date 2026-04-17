@@ -127,6 +127,87 @@ class DelayedInterimAgent:
         }
 
 
+class FlakyProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Progress adapter that can fail selected edit attempts."""
+
+    def __init__(self, *, edit_results, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self._edit_results = list(edit_results)
+        self._send_counter = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._send_counter += 1
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id=f"progress-{self._send_counter}")
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        success = self._edit_results.pop(0) if self._edit_results else True
+        if success:
+            return SendResult(success=True, message_id=message_id)
+        return SendResult(success=False, error="simulated edit failure")
+
+
+class FourToolAgent:
+    """Agent with enough tool steps to exercise fallback-then-resume editing."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "terminal", "pwd", {})
+        time.sleep(0.6)
+        self.tool_progress_callback("tool.started", "read_file", "cli.py", {})
+        time.sleep(0.6)
+        self.tool_progress_callback("tool.started", "search_files", "pattern", {})
+        time.sleep(0.6)
+        self.tool_progress_callback("tool.started", "terminal", "git status", {})
+        time.sleep(0.6)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class FiveToolAgent:
+    """Agent with one extra step to confirm disable-after-3-failures behavior."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for tool_name, preview in [
+            ("terminal", "pwd"),
+            ("read_file", "cli.py"),
+            ("search_files", "pattern"),
+            ("terminal", "git status"),
+            ("terminal", "git log"),
+        ]:
+            self.tool_progress_callback("tool.started", tool_name, preview, {})
+            time.sleep(0.6)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -280,6 +361,100 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     assert adapter.sent
     assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
     assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_progress_edit_failure_falls_back_once_then_resumes_editing(monkeypatch, tmp_path):
+    """A single edit failure should fallback-send once, then keep editing new progress message."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_EDIT_INTERVAL", "0")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FourToolAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = FlakyProgressCaptureAdapter(edit_results=[False, True])
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-edit-retry",
+        session_key="agent:main:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "done"
+    # The next edit should target the fallback message id (progress-2),
+    # proving we did not disable editing after one failure.
+    assert len(adapter.edits) >= 2
+    assert adapter.edits[0]["message_id"] == "progress-1"
+    assert adapter.edits[1]["message_id"] == "progress-2"
+    # Fallback-send happened at least once.
+    assert len(adapter.sent) >= 2
+
+
+@pytest.mark.asyncio
+async def test_progress_edit_disables_only_after_three_consecutive_failures(monkeypatch, tmp_path):
+    """Edit mode should degrade only after 3 consecutive edit failures."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_EDIT_INTERVAL", "0")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FiveToolAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    # First three edit attempts fail consecutively; any later potential edit
+    # success should not matter because the mode should already be degraded.
+    adapter = FlakyProgressCaptureAdapter(edit_results=[False, False, False, True])
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-edit-disable",
+        session_key="agent:main:telegram:group:-1001:17585",
+    )
+
+    assert result["final_response"] == "done"
+    # Exactly three edit attempts should occur; the 5th tool update should be
+    # send-only because edit mode is disabled after the 3rd consecutive failure.
+    assert len(adapter.edits) == 3
+    assert adapter.edits[0]["message_id"] == "progress-1"
+    assert adapter.edits[1]["message_id"] == "progress-2"
+    assert adapter.edits[2]["message_id"] == "progress-3"
+    assert len(adapter.sent) == 5
 
 
 # ---------------------------------------------------------------------------

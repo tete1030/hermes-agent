@@ -9464,9 +9464,14 @@ class GatewayRunner:
 
             progress_lines = []      # Accumulated tool lines
             progress_msg_id = None   # ID of the progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
+            can_edit = True          # False once repeated edit failures indicate edits are unusable
+            _edit_failure_streak = 0  # Counts consecutive edit failures only
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
-            _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+            _PROGRESS_EDIT_INTERVAL = max(
+                0.0,
+                float(os.getenv("HERMES_TOOL_PROGRESS_EDIT_INTERVAL", "1.5")),
+            )
+            _MAX_CONSECUTIVE_EDIT_FAILURES = 3
 
             while True:
                 try:
@@ -9514,18 +9519,47 @@ class GatewayRunner:
                             message_id=progress_msg_id,
                             content=full_text,
                         )
-                        if not result.success:
+                        if result.success:
+                            _edit_failure_streak = 0
+                        else:
+                            _edit_failure_streak += 1
                             _err = (getattr(result, "error", "") or "").lower()
                             if "flood" in _err or "retry after" in _err:
-                                # Flood control hit — disable further edits,
-                                # switch to sending new messages only for
-                                # important updates.  Don't block 23s.
                                 logger.info(
-                                    "[%s] Progress edits disabled due to flood control",
+                                    "[%s] Progress edit failed due to flood control (streak=%d/%d)",
                                     adapter.name,
+                                    _edit_failure_streak,
+                                    _MAX_CONSECUTIVE_EDIT_FAILURES,
                                 )
-                            can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, reply_to=event_message_id, metadata=_progress_metadata)
+                            else:
+                                logger.info(
+                                    "[%s] Progress edit failed (streak=%d/%d): %s",
+                                    adapter.name,
+                                    _edit_failure_streak,
+                                    _MAX_CONSECUTIVE_EDIT_FAILURES,
+                                    getattr(result, "error", None),
+                                )
+
+                            # Fallback for this update only: send a new message.
+                            # Keep edit mode enabled unless failures are consecutive
+                            # and exceed the threshold.
+                            fallback_result = await adapter.send(
+                                chat_id=source.chat_id,
+                                content=msg,
+                                reply_to=event_message_id,
+                                metadata=_progress_metadata,
+                            )
+                            if fallback_result.success and fallback_result.message_id:
+                                # Continue editing on the freshest fallback message.
+                                progress_msg_id = fallback_result.message_id
+
+                            if _edit_failure_streak >= _MAX_CONSECUTIVE_EDIT_FAILURES:
+                                can_edit = False
+                                logger.info(
+                                    "[%s] Progress edits disabled after %d consecutive failures",
+                                    adapter.name,
+                                    _edit_failure_streak,
+                                )
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
