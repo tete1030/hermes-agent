@@ -3662,6 +3662,12 @@ class GatewayRunner:
         
         if canonical == "undo":
             return await self._handle_undo_command(event)
+
+        if canonical == "turns":
+            return await self._handle_turns_command(event)
+
+        if canonical == "resume-turn":
+            return await self._handle_resume_turn_command(event)
         
         if canonical == "sethome":
             return await self._handle_set_home_command(event)
@@ -5951,30 +5957,157 @@ class GatewayRunner:
         # Let the normal message handler process it
         return await self._handle_message(retry_event)
     
-    async def _handle_undo_command(self, event: MessageEvent) -> str:
-        """Handle /undo command - remove the last user/assistant exchange."""
+    @staticmethod
+    def _parse_positive_int_arg(raw_value: str) -> int | None:
+        """Parse a positive integer argument, returning None for invalid values."""
+        value = (raw_value or "").strip()
+        if not value or not value.isdigit():
+            return None
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _turn_preview(content: Any, limit: int = 80) -> str:
+        text = "" if content is None else str(content).strip()
+        if not text:
+            return "(empty message)"
+        return text[:limit] + ("..." if len(text) > limit else "")
+
+    def _collect_user_turns(self, history: List[Dict[str, Any]]) -> list[tuple[int, int, str]]:
+        """Return (turn_number, message_index, preview) entries for each user turn."""
+        turns: list[tuple[int, int, str]] = []
+        turn_number = 0
+        for idx, msg in enumerate(history or []):
+            if msg.get("role") != "user":
+                continue
+            turn_number += 1
+            turns.append((turn_number, idx, self._turn_preview(msg.get("content"))))
+        return turns
+
+    def _truncate_before_turn(
+        self,
+        history: List[Dict[str, Any]],
+        turn_number: int,
+    ) -> tuple[List[Dict[str, Any]], int, int, str] | None:
+        """Return truncated history and removal stats for truncating before a turn."""
+        turns = self._collect_user_turns(history)
+        if not turns:
+            return None
+        if turn_number < 1 or turn_number > len(turns):
+            return None
+
+        _, target_idx, _ = turns[turn_number - 1]
+        removed_count = len(history) - target_idx
+        removed_turns = len(turns) - turn_number + 1
+        removed_preview = self._turn_preview(history[target_idx].get("content"), limit=60)
+        return history[:target_idx], removed_count, removed_turns, removed_preview
+
+    def _format_turns_listing(self, turns: list[tuple[int, int, str]], limit: int) -> str:
+        visible = turns[-max(1, limit):]
+        lines = ["🧭 **User Turns**"]
+        for turn_num, _, preview in visible:
+            lines.append(f"{turn_num}. {preview}")
+
+        hidden = len(turns) - len(visible)
+        if hidden > 0:
+            lines.append(f"_... {hidden} older turn{'s' if hidden != 1 else ''} hidden_")
+
+        lines.append("")
+        lines.append("Use `/resume-turn <turn_number>` or `/undo <count>`.")
+        return "\n".join(lines)
+
+    async def _handle_turns_command(self, event: MessageEvent) -> str:
+        """Handle /turns [count] — list selectable user turns."""
+        limit = 20
+        raw_arg = event.get_command_args().strip()
+        if raw_arg:
+            parsed = self._parse_positive_int_arg(raw_arg)
+            if parsed is None:
+                return "Usage: `/turns [count]` (count must be a positive integer)"
+            limit = parsed
+
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         history = self.session_store.load_transcript(session_entry.session_id)
-        
-        # Find the last user message and remove everything from it onward
-        last_user_idx = None
-        for i in range(len(history) - 1, -1, -1):
-            if history[i].get("role") == "user":
-                last_user_idx = i
-                break
-        
-        if last_user_idx is None:
+        turns = self._collect_user_turns(history)
+        if not turns:
+            return "No user turns yet in this session."
+        return self._format_turns_listing(turns, limit=limit)
+
+    async def _handle_resume_turn_command(self, event: MessageEvent) -> str:
+        """Handle /resume-turn <turn_number> by truncating history before that turn."""
+        raw_arg = event.get_command_args().strip()
+        turn_number = self._parse_positive_int_arg(raw_arg)
+        if turn_number is None:
+            usage = ["Usage: `/resume-turn <turn_number>`"]
+            source = event.source
+            session_entry = self.session_store.get_or_create_session(source)
+            history = self.session_store.load_transcript(session_entry.session_id)
+            turns = self._collect_user_turns(history)
+            if turns:
+                usage.append("")
+                usage.append(self._format_turns_listing(turns, limit=20))
+            return "\n".join(usage)
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        turns = self._collect_user_turns(history)
+        if not turns:
+            return "No user turns yet in this session."
+        if turn_number > len(turns):
+            return (
+                f"Turn `{turn_number}` is out of range (1-{len(turns)}).\n"
+                f"Use `/turns` to list available turns."
+            )
+
+        truncated = self._truncate_before_turn(history, turn_number)
+        if not truncated:
+            return "Nothing to rewind."
+
+        truncated_history, removed_count, removed_turns, removed_preview = truncated
+        self.session_store.rewrite_transcript(session_entry.session_id, truncated_history)
+        session_entry.last_prompt_tokens = 0
+        return (
+            f"↩️ Rewound to before turn `{turn_number}`. "
+            f"Removed {removed_count} message(s) across {removed_turns} turn{'s' if removed_turns != 1 else ''}.\n"
+            f"First removed turn: \"{removed_preview}\""
+        )
+
+    async def _handle_undo_command(self, event: MessageEvent) -> str:
+        """Handle /undo [count] - remove the last N user turns (default 1)."""
+        undo_count = 1
+        raw_arg = event.get_command_args().strip()
+        if raw_arg:
+            parsed = self._parse_positive_int_arg(raw_arg)
+            if parsed is None:
+                return "Usage: `/undo [count]` (count must be a positive integer)"
+            undo_count = parsed
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        turns = self._collect_user_turns(history)
+
+        if not turns:
             return "Nothing to undo."
-        
-        removed_msg = history[last_user_idx].get("content", "")
-        removed_count = len(history) - last_user_idx
-        self.session_store.rewrite_transcript(session_entry.session_id, history[:last_user_idx])
+
+        if undo_count > len(turns):
+            undo_count = len(turns)
+
+        target_turn = len(turns) - undo_count + 1
+        truncated = self._truncate_before_turn(history, target_turn)
+        if not truncated:
+            return "Nothing to undo."
+
+        truncated_history, removed_count, removed_turns, removed_preview = truncated
+        self.session_store.rewrite_transcript(session_entry.session_id, truncated_history)
         # Reset stored token count — transcript was truncated
         session_entry.last_prompt_tokens = 0
-        
-        preview = removed_msg[:40] + "..." if len(removed_msg) > 40 else removed_msg
-        return f"↩️ Undid {removed_count} message(s).\nRemoved: \"{preview}\""
+        return (
+            f"↩️ Undid {removed_count} message(s) across {removed_turns} turn{'s' if removed_turns != 1 else ''}.\n"
+            f"First removed turn: \"{removed_preview}\""
+        )
     
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""

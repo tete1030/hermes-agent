@@ -4898,37 +4898,126 @@ class HermesCLI:
         print(f"(^_^)b Retrying: \"{last_message[:60]}{'...' if len(last_message) > 60 else ''}\"")
         return last_message
     
-    def undo_last(self):
-        """Remove the last user/assistant exchange from conversation history.
-        
-        Walks backwards and removes all messages from the last user message
-        onward (including assistant responses, tool calls, etc.).
-        """
-        if not self.conversation_history:
-            print("(._.) No messages to undo.")
+    @staticmethod
+    def _parse_positive_int_arg(raw_value: str) -> int | None:
+        """Parse a positive integer argument, returning None for invalid values."""
+        value = (raw_value or "").strip()
+        if not value:
+            return None
+        if not value.isdigit():
+            return None
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+
+    @staticmethod
+    def _turn_preview(content: Any, limit: int = 80) -> str:
+        text = "" if content is None else str(content).strip()
+        if not text:
+            return "(empty message)"
+        return text[:limit] + ("..." if len(text) > limit else "")
+
+    def _collect_user_turns(self) -> list[tuple[int, int, str]]:
+        """Return (turn_number, message_index, preview) for each user turn."""
+        turns: list[tuple[int, int, str]] = []
+        turn_number = 0
+        for idx, msg in enumerate(self.conversation_history):
+            if msg.get("role") != "user":
+                continue
+            turn_number += 1
+            preview = self._turn_preview(msg.get("content"))
+            turns.append((turn_number, idx, preview))
+        return turns
+
+    def _show_turns(self, limit: int = 20) -> None:
+        """Show recent user turns with stable indices for /undo and /resume-turn."""
+        turns = self._collect_user_turns()
+        if not turns:
+            print("(._.) No user turns yet.")
             return
-        
-        # Walk backwards to find the last user message
-        last_user_idx = None
-        for i in range(len(self.conversation_history) - 1, -1, -1):
-            if self.conversation_history[i].get("role") == "user":
-                last_user_idx = i
-                break
-        
-        if last_user_idx is None:
+
+        display_limit = max(1, limit)
+        visible = turns[-display_limit:]
+        print()
+        print("+" + "-" * 50 + "+")
+        print("|" + " " * 15 + "(^_^) User Turns" + " " * 18 + "|")
+        print("+" + "-" * 50 + "+")
+        for turn_num, _, preview in visible:
+            print(f"  #{turn_num:>3}  {preview}")
+
+        if len(visible) < len(turns):
+            hidden = len(turns) - len(visible)
+            print(f"  ... ({hidden} older turn{'s' if hidden != 1 else ''} hidden)")
+        print()
+
+    def _truncate_before_turn(self, turn_number: int) -> tuple[int, int, str] | None:
+        """Truncate conversation to just before the given user turn number."""
+        turns = self._collect_user_turns()
+        if not turns:
+            print("(._.) No user turns yet.")
+            return None
+
+        if turn_number < 1 or turn_number > len(turns):
+            print(f"(._.) Turn #{turn_number} is out of range (1-{len(turns)}).")
+            return None
+
+        _, target_idx, _ = turns[turn_number - 1]
+        removed_count = len(self.conversation_history) - target_idx
+        removed_turns = len(turns) - turn_number + 1
+        removed_msg = self._turn_preview(self.conversation_history[target_idx].get("content"), limit=60)
+        self.conversation_history = self.conversation_history[:target_idx]
+        return removed_count, removed_turns, removed_msg
+
+    def _handle_resume_turn_command(self, cmd_original: str) -> None:
+        """Handle /resume-turn <turn_number> by truncating history before that turn."""
+        parts = cmd_original.split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            print("  Usage: /resume-turn <turn_number>")
+            self._show_turns(limit=20)
+            return
+
+        turn_number = self._parse_positive_int_arg(parts[1])
+        if turn_number is None:
+            print("  Usage: /resume-turn <turn_number>  (turn_number must be a positive integer)")
+            self._show_turns(limit=20)
+            return
+
+        truncated = self._truncate_before_turn(turn_number)
+        if not truncated:
+            return
+
+        removed_count, removed_turns, removed_msg = truncated
+        print(
+            f"(^_^)b Rewound to before turn #{turn_number}. "
+            f"Removed {removed_count} message(s) across {removed_turns} turn{'s' if removed_turns != 1 else ''}."
+        )
+        print(f"  First removed turn: \"{removed_msg}\"")
+        print(f"  {len(self.conversation_history)} message(s) remaining in history.")
+
+    def undo_last(self, count: int = 1):
+        """Remove the last N user turns (default 1) from conversation history."""
+        if count < 1:
+            print("(._.) /undo count must be a positive integer.")
+            return
+
+        turns = self._collect_user_turns()
+        if not turns:
             print("(._.) No user message found to undo.")
             return
-        
-        # Count how many messages we're removing
-        removed_count = len(self.conversation_history) - last_user_idx
-        removed_msg = self.conversation_history[last_user_idx].get("content", "")
-        
-        # Truncate history to before the last user message
-        self.conversation_history = self.conversation_history[:last_user_idx]
-        
-        print(f"(^_^)b Undid {removed_count} message(s). Removed: \"{removed_msg[:60]}{'...' if len(removed_msg) > 60 else ''}\"")
-        remaining = len(self.conversation_history)
-        print(f"  {remaining} message(s) remaining in history.")
+
+        if count > len(turns):
+            count = len(turns)
+
+        target_turn = len(turns) - count + 1
+        truncated = self._truncate_before_turn(target_turn)
+        if not truncated:
+            return
+
+        removed_count, removed_turns, removed_msg = truncated
+        print(
+            f"(^_^)b Undid {removed_count} message(s) across {removed_turns} turn{'s' if removed_turns != 1 else ''}. "
+            f"Removed: \"{removed_msg}\""
+        )
+        print(f"  {len(self.conversation_history)} message(s) remaining in history.")
     
     def _run_curses_picker(self, title: str, items: list[str], default_index: int = 0) -> int | None:
         """Run curses_single_select via run_in_terminal so prompt_toolkit handles terminal ownership cleanly."""
@@ -6042,7 +6131,27 @@ class HermesCLI:
                 # Re-queue the message so process_loop sends it to the agent
                 self._pending_input.put(retry_msg)
         elif canonical == "undo":
-            self.undo_last()
+            parts = cmd_original.split(None, 1)
+            undo_count = 1
+            if len(parts) > 1 and parts[1].strip():
+                parsed = self._parse_positive_int_arg(parts[1])
+                if parsed is None:
+                    _cprint("  Usage: /undo [count]  (count must be a positive integer)")
+                else:
+                    undo_count = parsed
+            self.undo_last(undo_count)
+        elif canonical == "turns":
+            parts = cmd_original.split(None, 1)
+            limit = 20
+            if len(parts) > 1 and parts[1].strip():
+                parsed = self._parse_positive_int_arg(parts[1])
+                if parsed is None:
+                    _cprint("  Usage: /turns [count]  (count must be a positive integer)")
+                else:
+                    limit = parsed
+            self._show_turns(limit=limit)
+        elif canonical == "resume-turn":
+            self._handle_resume_turn_command(cmd_original)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
         elif canonical == "save":
