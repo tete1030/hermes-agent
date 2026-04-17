@@ -20,6 +20,8 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_skill_source_alias,
+    get_skills_source_aliases,
     iter_skill_index_files,
     parse_frontmatter,
     skill_matches_platform,
@@ -666,10 +668,14 @@ def build_skills_system_prompt(
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
             return cached
 
+    disabled = get_disabled_skill_names()
+    source_aliases = get_skills_source_aliases()
+    local_source_alias = get_skill_source_alias(skills_dir, source_aliases)
+
     # ── Layer 2: disk snapshot ────────────────────────────────────────
     snapshot = _load_skills_snapshot(skills_dir)
 
-    skills_by_category: dict[str, list[tuple[str, str]]] = {}
+    skills_by_category: dict[str, list[tuple[str, str, str]]] = {}
     category_descriptions: dict[str, str] = {}
 
     if snapshot is not None:
@@ -692,7 +698,7 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(category, []).append(
-                (frontmatter_name, entry.get("description", ""))
+                (frontmatter_name, entry.get("description", ""), local_source_alias)
             )
         category_descriptions = {
             str(k): str(v)
@@ -717,7 +723,7 @@ def build_skills_system_prompt(
             ):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
-                (entry["frontmatter_name"], entry["description"])
+                (entry["frontmatter_name"], entry["description"], local_source_alias)
             )
 
         # Read category-level DESCRIPTION.md files
@@ -747,12 +753,13 @@ def build_skills_system_prompt(
     # precedence: we track seen names and skip duplicates from external dirs.
     seen_skill_names: set[str] = set()
     for cat_skills in skills_by_category.values():
-        for name, _desc in cat_skills:
+        for name, _desc, _source in cat_skills:
             seen_skill_names.add(name)
 
     for ext_dir in external_dirs:
         if not ext_dir.exists():
             continue
+        ext_source_alias = get_skill_source_alias(ext_dir, source_aliases)
         for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
             try:
                 is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
@@ -773,7 +780,7 @@ def build_skills_system_prompt(
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (frontmatter_name, entry["description"], ext_source_alias)
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
@@ -804,14 +811,17 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}:")
             # Deduplicate and sort skills within each category
             seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            for name, desc, source in sorted(
+                skills_by_category[category], key=lambda x: x[0]
+            ):
                 if name in seen:
                     continue
                 seen.add(name)
+                source_label = f" [source: {source}]" if source else ""
                 if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                    index_lines.append(f"    - {name}{source_label}: {desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"    - {name}{source_label}")
 
         result = (
             "## Skills (mandatory)\n"

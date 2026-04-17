@@ -554,7 +554,12 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import (
+        get_external_skills_dirs,
+        get_skill_source_alias,
+        get_skills_source_aliases,
+        iter_skill_index_files,
+    )
 
     skills = []
     seen_names: set = set()
@@ -567,8 +572,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     if SKILLS_DIR.exists():
         dirs_to_scan.append(SKILLS_DIR)
     dirs_to_scan.extend(get_external_skills_dirs())
+    source_aliases = get_skills_source_aliases()
 
     for scan_dir in dirs_to_scan:
+        source_alias = get_skill_source_alias(scan_dir, source_aliases)
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
@@ -606,6 +613,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "source": source_alias,
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -672,8 +680,8 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
-    Returns only name + description to minimize token usage. Use skill_view() to
-    load full content, tags, related files, etc.
+    Returns name + description (+ source alias) for low-overhead discovery. Use
+    skill_view() to load full content, tags, related files, etc.
 
     Args:
         category: Optional category filter (e.g., "mlops")
