@@ -168,6 +168,23 @@ def _normalize_string_set(values) -> Set[str]:
     return {str(v).strip() for v in values if str(v).strip()}
 
 
+def _load_skills_config() -> Dict[str, Any]:
+    """Load and return the ``skills`` config section from config.yaml."""
+    config_path = get_config_path()
+    if not config_path.exists():
+        return {}
+    try:
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return {}
+    return skills_cfg
+
+
 # ── External skills directories ──────────────────────────────────────────
 
 
@@ -178,18 +195,8 @@ def get_external_skills_dirs() -> List[Path]:
     path.  Only directories that actually exist are returned.  Duplicates and
     paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
     """
-    config_path = get_config_path()
-    if not config_path.exists():
-        return []
-    try:
-        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    if not isinstance(parsed, dict):
-        return []
-
-    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
+    skills_cfg = _load_skills_config()
+    if not skills_cfg:
         return []
 
     raw_dirs = skills_cfg.get("external_dirs")
@@ -222,6 +229,52 @@ def get_external_skills_dirs() -> List[Path]:
             logger.debug("External skills dir does not exist, skipping: %s", p)
 
     return result
+
+
+def get_skills_source_aliases() -> Dict[Path, str]:
+    """Return configured source aliases keyed by resolved skills-dir path.
+
+    Reads ``skills.source_aliases`` from config.yaml, where keys are directory
+    paths and values are short display aliases.
+    """
+    skills_cfg = _load_skills_config()
+    raw_aliases = skills_cfg.get("source_aliases") if skills_cfg else None
+    if not isinstance(raw_aliases, dict):
+        return {}
+
+    aliases: Dict[Path, str] = {}
+    for raw_path, raw_alias in raw_aliases.items():
+        alias = str(raw_alias).strip() if raw_alias is not None else ""
+        if not alias:
+            continue
+        path_str = str(raw_path).strip()
+        if not path_str:
+            continue
+        try:
+            resolved = Path(os.path.expanduser(os.path.expandvars(path_str))).resolve()
+        except Exception:
+            continue
+        aliases[resolved] = alias
+    return aliases
+
+
+def get_skill_source_alias(
+    skills_dir: Path, aliases: Optional[Dict[Path, str]] = None
+) -> str:
+    """Resolve a short source alias for a skills directory."""
+    resolved_dir = skills_dir.resolve()
+    alias_map = aliases if aliases is not None else get_skills_source_aliases()
+    configured = alias_map.get(resolved_dir)
+    if configured:
+        return configured
+
+    if resolved_dir == get_skills_dir().resolve():
+        return "local"
+
+    fallback = resolved_dir.name or "external"
+    if fallback.lower() == "skills" and resolved_dir.parent.name:
+        fallback = resolved_dir.parent.name
+    return str(fallback).strip() or "external"
 
 
 def get_all_skills_dirs() -> List[Path]:

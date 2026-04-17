@@ -722,8 +722,11 @@ DEFAULT_CONFIG = {
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
+    # ``source_aliases`` maps skills directory paths to short source labels shown
+    # in available_skills and skills_list (e.g. {"/path/to/agent-skill/skills": "agent-skill"}).
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        "source_aliases": {},  # path -> short alias used for source labeling
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -732,7 +735,7 @@ DEFAULT_CONFIG = {
         # Pre-execute inline shell snippets written as !`cmd` in SKILL.md
         # body.  Their stdout is inlined into the skill message before the
         # agent reads it, so skills can inject dynamic context (dates, git
-        # state, detected tool versions, …).  Off by default because any
+        # state, detected tool versions, ...).  Off by default because any
         # content from the skill author runs on the host without approval;
         # only enable for skill sources you trust.
         "inline_shell": False,
