@@ -2421,6 +2421,19 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
 
 
 
+def _is_codex_model(model: Optional[str]) -> bool:
+    """Return True when the resolved model is a Codex-family model.
+
+    Supports names with provider prefixes like "openai/gpt-5-codex".
+    """
+    if not model:
+        return False
+    normalized = str(model).strip().lower()
+    if "/" in normalized:
+        normalized = normalized.split("/", 1)[1]
+    return "codex" in normalized
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -2455,7 +2468,11 @@ def _build_call_kwargs(
             temperature = None
 
     if temperature is not None:
-        kwargs["temperature"] = temperature
+        # Codex models on this backend only accept temperature=1.0.
+        if _is_codex_model(model):
+            kwargs["temperature"] = 1
+        else:
+            kwargs["temperature"] = temperature
 
     if max_tokens is not None:
         # Codex adapter handles max_tokens internally; OpenRouter/Nous use max_tokens.
