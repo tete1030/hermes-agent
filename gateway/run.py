@@ -9551,7 +9551,11 @@ class GatewayRunner:
                             )
                             if fallback_result.success and fallback_result.message_id:
                                 # Continue editing on the freshest fallback message.
+                                # IMPORTANT: this new message currently contains only
+                                # `msg`, so future edits must not replay older lines
+                                # from the previous message.
                                 progress_msg_id = fallback_result.message_id
+                                progress_lines = [msg]
 
                             if _edit_failure_streak >= _MAX_CONSECUTIVE_EDIT_FAILURES:
                                 can_edit = False
