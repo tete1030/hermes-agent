@@ -365,7 +365,7 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
 @pytest.mark.asyncio
 async def test_progress_edit_failure_falls_back_once_then_resumes_editing(monkeypatch, tmp_path):
-    """A single edit failure should fallback-send once, then keep editing new progress message."""
+    """A single edit failure should fallback-send once, then keep editing new progress message without replaying old lines."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_EDIT_INTERVAL", "0")
 
@@ -407,6 +407,10 @@ async def test_progress_edit_failure_falls_back_once_then_resumes_editing(monkey
     assert adapter.edits[1]["message_id"] == "progress-2"
     # Fallback-send happened at least once.
     assert len(adapter.sent) >= 2
+    assert 'read_file: "cli.py"' in adapter.sent[1]["content"]
+    # After switching to progress-2, edits should only contain the new segment
+    # (no replay of the first line from progress-1).
+    assert 'terminal: "pwd"' not in adapter.edits[1]["content"]
 
 
 @pytest.mark.asyncio
