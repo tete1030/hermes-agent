@@ -75,6 +75,24 @@ class FakeAgent:
         }
 
 
+class ParallelToolAgent:
+    """Agent that emits multiple tool starts before the progress loop flushes."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "skill_view", "agent-browser-harness", {})
+        self.tool_progress_callback("tool.started", "terminal", "ssh pubdeb2", {"command": "ssh pubdeb2"})
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class LongPreviewAgent:
     """Agent that emits a tool call with a very long preview string."""
     LONG_CMD = "cd /home/teknium/.hermes/hermes-agent/.worktrees/hermes-d8860339 && source .venv/bin/activate && python -m pytest tests/gateway/test_run_progress_topics.py -n0 -q"
@@ -233,6 +251,57 @@ def _make_runner(adapter):
 
 
 @pytest.mark.asyncio
+async def test_parallel_tool_starts_are_all_visible_in_progress_trace(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_EDIT_INTERVAL", "0")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = ParallelToolAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401
+
+    adapter = ProgressCaptureAdapter(platform=Platform.FEISHU)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_test",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-parallel",
+        session_key="agent:main:feishu:dm:oc_test",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == [
+        {
+            "chat_id": "oc_test",
+            "content": '⚙️ skill_view: "agent-browser-harness"',
+            "reply_to": None,
+            "metadata": None,
+        }
+    ]
+    assert adapter.edits
+    assert adapter.edits[-1]["content"] == '\n'.join([
+        '⚙️ skill_view: "agent-browser-harness"',
+        '💻 terminal: "ssh pubdeb2"',
+    ])
+
+
+@pytest.mark.asyncio
 async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
@@ -359,8 +428,17 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
-    assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "1234567890.000001",
+        "root_message_id": "1234567890.000001",
+    }
+    assert all(
+        call["metadata"] == {
+            "thread_id": "1234567890.000001",
+            "root_message_id": "1234567890.000001",
+        }
+        for call in adapter.typing
+    )
 
 
 @pytest.mark.asyncio
