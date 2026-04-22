@@ -205,6 +205,32 @@ def test_feasibility_check_ignores_invalid_context_length(mock_get_client, mock_
     )
 
 
+@patch("agent.model_metadata.get_model_context_length", return_value=272_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_feasibility_check_reuses_main_context_when_aux_matches_main_runtime(mock_get_client, mock_ctx_len):
+    """If auxiliary auto-routing resolves to the live main runtime, reuse the
+    already-resolved main context length to avoid probing down to 128K."""
+    agent = _make_agent(main_context=272_000, threshold_percent=0.50)
+    agent.provider = "litellm"
+    agent.model = "gpt-5.3-codex"
+    agent.base_url = "http://custom-endpoint:8080/v1"
+
+    mock_client = MagicMock()
+    mock_client.base_url = "http://custom-endpoint:8080/v1"
+    mock_client.api_key = "no-key-required"
+    mock_get_client.return_value = (mock_client, "gpt-5.3-codex")
+
+    agent._emit_status = lambda msg: None
+    agent._check_compression_model_feasibility()
+
+    mock_ctx_len.assert_called_once_with(
+        "gpt-5.3-codex",
+        base_url="http://custom-endpoint:8080/v1",
+        api_key="no-key-required",
+        config_context_length=272_000,
+    )
+
+
 def test_init_feasibility_check_uses_aux_context_override_from_config():
     """Real AIAgent init should cache and forward auxiliary.compression.context_length."""
 
