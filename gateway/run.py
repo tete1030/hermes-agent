@@ -9524,29 +9524,17 @@ class GatewayRunner:
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
+        pending_progress = {}  # tool call id -> rendered progress line
+        completed_progress_ids = set()
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-        
-        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
-            """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
-                return
 
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
-            if event_type not in ("tool.started",):
-                return
-
-            # "new" mode: only report when tool changes
-            if progress_mode == "new" and tool_name == last_tool[0]:
-                return
-            last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+        def _render_progress_message(tool_name: str = None, preview: str = None, args: dict = None) -> str:
+            """Render one tool progress line for gateway transports."""
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
-            
-            # Verbose mode: show detailed arguments, respects tool_preview_length
+
             if progress_mode == "verbose":
                 if args:
                     from agent.display import get_tool_preview_max_len
@@ -9557,39 +9545,52 @@ class GatewayRunner:
                     # detail.  Platform message-length limits handle the rest.
                     if _pl > 0 and len(args_str) > _pl:
                         args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                elif preview:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
-                else:
-                    msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
-                return
-            
-            # "all" / "new" modes: short preview, respects tool_preview_length
-            # config (defaults to 40 chars when unset to keep gateway messages
-            # compact — unlike CLI spinners, these persist as permanent messages).
+                    return f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                if preview:
+                    return f"{emoji} {tool_name}: \"{preview}\""
+                return f"{emoji} {tool_name}..."
+
             if preview:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
                 if len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
-            else:
-                msg = f"{emoji} {tool_name}..."
-            
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
+                return f"{emoji} {tool_name}: \"{preview}\""
+            return f"{emoji} {tool_name}..."
+
+        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+            """Callback invoked by agent on tool lifecycle events."""
+            if not progress_queue or not _run_still_current():
+                return
+
+            tool_call_id = kwargs.get("tool_call_id")
+
+            if event_type == "tool.completed":
+                if tool_call_id:
+                    completed_progress_ids.add(tool_call_id)
+                return
+
+            if event_type != "tool.started":
+                return
+
+            if progress_mode == "new" and tool_name == last_tool[0]:
+                return
+            last_tool[0] = tool_name
+
+            msg = _render_progress_message(tool_name, preview, args)
+            if tool_call_id:
+                pending_progress[tool_call_id] = msg
+                progress_queue.put(("__tool_started__", tool_call_id, msg))
+                return
+
             if msg == last_progress_msg[0]:
                 repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
                 progress_queue.put(("__dedup__", msg, repeat_count[0]))
                 return
             last_progress_msg[0] = msg
             repeat_count[0] = 0
-            
+
             progress_queue.put(msg)
         
         # Background task to send progress messages
@@ -9604,7 +9605,10 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id, "root_message_id": event_message_id} if _progress_thread_id else None
+        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        if event_message_id and source.platform == Platform.SLACK:
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata["root_message_id"] = event_message_id
 
         async def send_progress_messages():
             if not progress_queue:
@@ -9649,7 +9653,15 @@ class GatewayRunner:
                     raw = progress_queue.get_nowait()
 
                     # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_started__":
+                        _, tool_call_id, msg = raw
+                        if tool_call_id in completed_progress_ids:
+                            pending_progress.pop(tool_call_id, None)
+                            completed_progress_ids.discard(tool_call_id)
+                            continue
+                        progress_lines.append(msg)
+                        pending_progress.pop(tool_call_id, None)
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -9752,12 +9764,22 @@ class GatewayRunner:
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_started__":
+                                _, tool_call_id, msg = raw
+                                if tool_call_id in completed_progress_ids:
+                                    pending_progress.pop(tool_call_id, None)
+                                    completed_progress_ids.discard(tool_call_id)
+                                    continue
+                                progress_lines.append(msg)
+                                pending_progress.pop(tool_call_id, None)
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                                msg = progress_lines[-1] if progress_lines else base_msg
                             else:
-                                progress_lines.append(raw)
+                                msg = raw
+                                progress_lines.append(msg)
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)

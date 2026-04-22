@@ -7871,7 +7871,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback("tool.started", name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args, tool_call_id=tc.id)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -8030,6 +8030,7 @@ class AIAgent:
                         self.tool_progress_callback(
                             "tool.completed", function_name, None, None,
                             duration=tool_duration, is_error=is_error,
+                            tool_call_id=tc.id,
                         )
                     except Exception as cb_err:
                         logging.debug(f"Tool progress callback error: {cb_err}")
