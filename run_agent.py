@@ -2213,11 +2213,27 @@ class AIAgent:
             aux_base_url = str(getattr(client, "base_url", ""))
             aux_api_key = str(getattr(client, "api_key", ""))
 
+            aux_context_override = getattr(self, "_aux_compression_context_length_config", None)
+            if aux_context_override is None:
+                # Auto mode often resolves compression to the exact same main
+                # runtime (same model + endpoint). Reuse the already-resolved
+                # main context length so custom endpoints without /models do
+                # not probe down to the 128K fallback.
+                main_model = str(getattr(self, "model", "") or "")
+                main_base_url = str(getattr(self, "base_url", "") or "")
+                main_context = int(getattr(self.context_compressor, "context_length", 0) or 0)
+                if (
+                    main_context > 0
+                    and aux_model == main_model
+                    and aux_base_url.rstrip("/") == main_base_url.rstrip("/")
+                ):
+                    aux_context_override = main_context
+
             aux_context = get_model_context_length(
                 aux_model,
                 base_url=aux_base_url,
                 api_key=aux_api_key,
-                config_context_length=getattr(self, "_aux_compression_context_length_config", None),
+                config_context_length=aux_context_override,
             )
 
             # Hard floor: the auxiliary compression model must have at least
