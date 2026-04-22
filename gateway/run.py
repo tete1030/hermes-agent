@@ -14935,6 +14935,8 @@ class GatewayRunner:
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
+        pending_progress = {}  # tool call id -> rendered progress line
+        completed_progress_ids = set()
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -14961,71 +14963,11 @@ class GatewayRunner:
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
-        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
-            """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
-                return
-
-            # First-touch onboarding: the first time a tool takes longer than
-            # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
-            # (progress_mode == "all"), append a one-time hint suggesting
-            # /verbose.  We only fire when (a) the user hasn't seen the hint
-            # before and (b) /verbose is actually usable on this platform
-            # (gateway gate must be open).  The CLI has its own trigger.
-            if event_type == "tool.completed" and not long_tool_hint_fired[0]:
-                try:
-                    duration = kwargs.get("duration") or 0
-                    if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
-                        from agent.onboarding import (
-                            TOOL_PROGRESS_FLAG,
-                            is_seen,
-                            mark_seen,
-                            tool_progress_hint_gateway,
-                        )
-                        _cfg = _load_gateway_config()
-                        gate_on = is_truthy_value(
-                            cfg_get(_cfg, "display", "tool_progress_command"),
-                            default=False,
-                        )
-                        if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
-                            long_tool_hint_fired[0] = True
-                            progress_queue.put(tool_progress_hint_gateway())
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
-                except Exception as _hint_err:
-                    logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
-                return
-
-
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
-            if event_type not in {"tool.started",}:
-                return
-
-            # Suppress tool-progress bubbles once the user has sent `stop`.
-            # When the LLM response carries N parallel tool calls, the agent
-            # fires N "tool.started" events back-to-back before checking for
-            # interrupts — without this guard, a late `stop` still renders
-            # all N as 🔍 bubbles, making the interrupt feel ignored.
-            # (agent lives in run_sync's scope; agent_holder[0] is the shared
-            # handle across nested scopes — see line ~9607.)
-            try:
-                _agent_for_interrupt = agent_holder[0] if agent_holder else None
-                if _agent_for_interrupt is not None and getattr(
-                    _agent_for_interrupt, "is_interrupted", False
-                ):
-                    return
-            except Exception:
-                pass
-
-            # "new" mode: only report when tool changes
-            if progress_mode == "new" and tool_name == last_tool[0]:
-                return
-            last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+        def _render_progress_message(tool_name: str = None, preview: str = None, args: dict = None) -> str:
+            """Render one tool progress line for gateway transports."""
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
-            
-            # Verbose mode: show detailed arguments, respects tool_preview_length
+
             if progress_mode == "verbose":
                 if args:
                     from agent.display import get_tool_preview_max_len
@@ -15036,39 +14978,92 @@ class GatewayRunner:
                     # detail.  Platform message-length limits handle the rest.
                     if _pl > 0 and len(args_str) > _pl:
                         args_str = args_str[:_pl - 3] + "..."
-                    msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                elif preview:
-                    msg = f"{emoji} {tool_name}: \"{preview}\""
-                else:
-                    msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
-                return
-            
-            # "all" / "new" modes: short preview, respects tool_preview_length
-            # config (defaults to 40 chars when unset to keep gateway messages
-            # compact — unlike CLI spinners, these persist as permanent messages).
+                    return f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                if preview:
+                    return f"{emoji} {tool_name}: \"{preview}\""
+                return f"{emoji} {tool_name}..."
+
             if preview:
                 from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
                 _cap = _pl if _pl > 0 else 40
                 if len(preview) > _cap:
                     preview = preview[:_cap - 3] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
-            else:
-                msg = f"{emoji} {tool_name}..."
-            
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
+                return f"{emoji} {tool_name}: \"{preview}\""
+            return f"{emoji} {tool_name}..."
+
+        def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
+            """Callback invoked by agent on tool lifecycle events."""
+            if not progress_queue or not _run_still_current():
+                return
+
+            tool_call_id = kwargs.get("tool_call_id")
+
+            # First-touch onboarding: the first time a tool takes longer than
+            # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
+            # (progress_mode == "all"), append a one-time hint suggesting
+            # /verbose. We only fire when (a) the user hasn't seen the hint
+            # before and (b) /verbose is actually usable on this platform.
+            if event_type == "tool.completed":
+                if not long_tool_hint_fired[0]:
+                    try:
+                        duration = kwargs.get("duration") or 0
+                        if duration >= _LONG_TOOL_THRESHOLD_S and progress_mode == "all":
+                            from agent.onboarding import (
+                                TOOL_PROGRESS_FLAG,
+                                is_seen,
+                                mark_seen,
+                                tool_progress_hint_gateway,
+                            )
+                            _cfg = _load_gateway_config()
+                            gate_on = is_truthy_value(
+                                cfg_get(_cfg, "display", "tool_progress_command"),
+                                default=False,
+                            )
+                            if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
+                                long_tool_hint_fired[0] = True
+                                progress_queue.put(tool_progress_hint_gateway())
+                                mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                    except Exception as _hint_err:
+                        logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
+                if tool_call_id:
+                    completed_progress_ids.add(tool_call_id)
+                return
+
+            if event_type != "tool.started":
+                return
+
+            # Suppress tool-progress bubbles once the user has sent `stop`.
+            # When the LLM response carries N parallel tool calls, the agent
+            # fires N "tool.started" events back-to-back before checking for
+            # interrupts — without this guard, a late `stop` still renders
+            # all N as bubbles, making the interrupt feel ignored.
+            try:
+                _agent_for_interrupt = agent_holder[0] if agent_holder else None
+                if _agent_for_interrupt is not None and getattr(
+                    _agent_for_interrupt, "is_interrupted", False
+                ):
+                    return
+            except Exception:
+                pass
+
+            if progress_mode == "new" and tool_name == last_tool[0]:
+                return
+            last_tool[0] = tool_name
+
+            msg = _render_progress_message(tool_name, preview, args)
+            if tool_call_id:
+                pending_progress[tool_call_id] = msg
+                progress_queue.put(("__tool_started__", tool_call_id, msg))
+                return
+
             if msg == last_progress_msg[0]:
                 repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
                 progress_queue.put(("__dedup__", msg, repeat_count[0]))
                 return
             last_progress_msg[0] = msg
             repeat_count[0] = 0
-            
+
             progress_queue.put(msg)
         
         # Background task to send progress messages
@@ -15155,7 +15150,15 @@ class GatewayRunner:
                         pass
 
                     # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_started__":
+                        _, tool_call_id, msg = raw
+                        if tool_call_id in completed_progress_ids:
+                            pending_progress.pop(tool_call_id, None)
+                            completed_progress_ids.discard(tool_call_id)
+                            continue
+                        progress_lines.append(msg)
+                        pending_progress.pop(tool_call_id, None)
+                    elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                         _, base_msg, count = raw
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
@@ -15290,10 +15293,19 @@ class GatewayRunner:
                     while not progress_queue.empty():
                         try:
                             raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__tool_started__":
+                                _, tool_call_id, msg = raw
+                                if tool_call_id in completed_progress_ids:
+                                    pending_progress.pop(tool_call_id, None)
+                                    completed_progress_ids.discard(tool_call_id)
+                                    continue
+                                progress_lines.append(msg)
+                                pending_progress.pop(tool_call_id, None)
+                            elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                                 _, base_msg, count = raw
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                                msg = progress_lines[-1] if progress_lines else base_msg
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
@@ -15313,7 +15325,8 @@ class GatewayRunner:
                                 last_progress_msg[0] = None
                                 repeat_count[0] = 0
                             else:
-                                progress_lines.append(raw)
+                                msg = raw
+                                progress_lines.append(msg)
                         except Exception:
                             break
                     # Final edit with all remaining tools (only if editing works)
