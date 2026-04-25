@@ -6,7 +6,7 @@ background session) across gateway messenger platforms.
 
 import asyncio
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -107,6 +107,29 @@ class TestHandleBackgroundCommand:
         assert "bg_" in result  # task ID starts with bg_
         assert "Summarize the top HN stories" in result
         assert len(created_tasks) == 1  # background task was created
+
+    @pytest.mark.asyncio
+    async def test_threaded_background_passes_message_id_to_task(self):
+        """Thread replies keep the parent message ID when the async task starts."""
+        runner = _make_runner()
+        runner._run_background_task = AsyncMock()
+        event = _make_event(text="/background summarize this")
+        event.message_id = "om_parent"
+        event.source.thread_id = "omt-thread"
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            return MagicMock()
+
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            await runner._handle_background_command(event)
+
+        runner._run_background_task.assert_called_once_with(
+            "summarize this",
+            event.source,
+            ANY,
+            "om_parent",
+        )
 
     @pytest.mark.asyncio
     async def test_prompt_truncated_in_preview(self):
@@ -287,6 +310,37 @@ class TestRunBackgroundTask:
         call_args = mock_adapter.send.call_args
         content = call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "")
         assert "failed" in content.lower()
+
+
+class TestHandleBtwCommand:
+    """Tests for GatewayRunner._handle_btw_command."""
+
+    @pytest.mark.asyncio
+    async def test_threaded_btw_passes_message_id_to_task(self):
+        """/btw keeps the parent message ID when scheduling a thread reply."""
+        runner = _make_runner()
+        runner._run_btw_task = AsyncMock()
+        event = _make_event(text="/btw what changed?")
+        event.message_id = "om_parent"
+        event.source.thread_id = "omt-thread"
+
+        def capture_task(coro, *args, **kwargs):
+            coro.close()
+            task = MagicMock()
+            task.done.return_value = False
+            return task
+
+        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+            result = await runner._handle_btw_command(event)
+
+        assert "Reply will appear here shortly" in result
+        runner._run_btw_task.assert_called_once_with(
+            "what changed?",
+            event.source,
+            ANY,
+            ANY,
+            "om_parent",
+        )
 
 
 # ---------------------------------------------------------------------------

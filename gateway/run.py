@@ -6640,7 +6640,7 @@ class GatewayRunner:
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(
-            self._run_background_task(prompt, source, task_id)
+            self._run_background_task(prompt, source, task_id, event.message_id)
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
@@ -6649,7 +6649,11 @@ class GatewayRunner:
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        event_message_id: str | None = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -6659,7 +6663,9 @@ class GatewayRunner:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
 
-        _thread_metadata = {"thread_id": source.thread_id, "root_message_id": event.message_id} if source.thread_id else None
+        _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        if _thread_metadata and event_message_id:
+            _thread_metadata["root_message_id"] = event_message_id
 
         try:
             user_config = _load_gateway_config()
@@ -6812,7 +6818,9 @@ class GatewayRunner:
 
         import uuid as _uuid
         task_id = f"btw_{datetime.now().strftime('%H%M%S')}_{_uuid.uuid4().hex[:6]}"
-        _task = asyncio.create_task(self._run_btw_task(question, source, session_key, task_id))
+        _task = asyncio.create_task(
+            self._run_btw_task(question, source, session_key, task_id, event.message_id)
+        )
         self._background_tasks.add(_task)
         self._active_btw_tasks[session_key] = _task
 
@@ -6827,7 +6835,12 @@ class GatewayRunner:
         return f'💬 /btw: "{preview}"\nReply will appear here shortly.'
 
     async def _run_btw_task(
-        self, question: str, source, session_key: str, task_id: str,
+        self,
+        question: str,
+        source,
+        session_key: str,
+        task_id: str,
+        event_message_id: str | None = None,
     ) -> None:
         """Execute an ephemeral /btw side question and deliver the answer."""
         from run_agent import AIAgent
@@ -6837,7 +6850,9 @@ class GatewayRunner:
             logger.warning("No adapter for platform %s in /btw task %s", source.platform, task_id)
             return
 
-        _thread_meta = {"thread_id": source.thread_id, "root_message_id": event.message_id} if source.thread_id else None
+        _thread_meta = {"thread_id": source.thread_id} if source.thread_id else None
+        if _thread_meta and event_message_id:
+            _thread_meta["root_message_id"] = event_message_id
 
         try:
             user_config = _load_gateway_config()

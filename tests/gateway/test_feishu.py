@@ -1856,6 +1856,55 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(captured["request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_falls_back_to_new_message_when_metadata_root_reply_target_is_missing(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"reply": [], "create": []}
+
+        class _MessageAPI:
+            def reply(self, request):
+                captured["reply"].append(request)
+                return SimpleNamespace(
+                    success=lambda: False,
+                    code=230011,
+                    msg="reply target missing",
+                )
+
+            def create(self, request):
+                captured["create"].append(request)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_fallback"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="hello",
+                    metadata={"thread_id": "omt-thread", "root_message_id": "om_parent"},
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_fallback")
+        self.assertEqual(len(captured["reply"]), 1)
+        self.assertEqual(len(captured["create"]), 1)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
