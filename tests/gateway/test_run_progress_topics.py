@@ -20,6 +20,7 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         self.sent = []
         self.edits = []
         self.typing = []
+        self._message_counter = 0
 
     async def connect(self) -> bool:
         return True
@@ -36,9 +37,10 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
                 "metadata": metadata,
             }
         )
-        return SendResult(success=True, message_id="progress-1")
+        self._message_counter += 1
+        return SendResult(success=True, message_id=f"progress-{self._message_counter}")
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
         self.edits.append(
             {
                 "chat_id": chat_id,
@@ -145,6 +147,147 @@ class DelayedInterimAgent:
         }
 
 
+class LifecycleStatusAgent:
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.status_callback(
+            "lifecycle",
+            "🗜️ Context compacted; prior work is preserved in the handoff summary.",
+        )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class CompressionLifecycleAgent:
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.status_callback(
+            "compression.started",
+            {
+                "message": "🗜️ Compressing context...",
+                "before_count": 12,
+            },
+        )
+        time.sleep(0.1)
+        self.status_callback(
+            "compression.completed",
+            {
+                "message": "✅ Context compacted: 12 -> 5",
+                "before_count": 12,
+                "after_count": 5,
+                "saved_messages": 7,
+                "compression_count": 1,
+            },
+        )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class TwoCompressionLifecycleAgent:
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.status_callback(
+            "compression.started",
+            {"message": "🗜️ Compressing context...", "before_count": 12},
+        )
+        time.sleep(0.05)
+        self.status_callback(
+            "compression.completed",
+            {
+                "message": "✅ Context compacted: 12 -> 5",
+                "before_count": 12,
+                "after_count": 5,
+                "saved_messages": 7,
+                "compression_count": 1,
+            },
+        )
+        time.sleep(0.05)
+        self.status_callback(
+            "compression.started",
+            {"message": "🗜️ Compressing context again...", "before_count": 9},
+        )
+        time.sleep(0.05)
+        self.status_callback(
+            "compression.completed",
+            {
+                "message": "✅ Context compacted: 9 -> 4",
+                "before_count": 9,
+                "after_count": 4,
+                "saved_messages": 5,
+                "compression_count": 2,
+            },
+        )
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class NonEditingStatusAdapter(ProgressCaptureAdapter):
+    SUPPORTS_MESSAGE_EDITING = False
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        return SendResult(success=False, error="Not supported")
+
+
+class FinalizeAwareStatusAdapter(ProgressCaptureAdapter):
+    REQUIRES_EDIT_FINALIZE = True
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": finalize,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
+
+
+class FlakyCompactionStatusAdapter(ProgressCaptureAdapter):
+    def __init__(self, *, edit_results, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self._edit_results = list(edit_results)
+
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "finalize": finalize,
+            }
+        )
+        success = self._edit_results.pop(0) if self._edit_results else True
+        if success:
+            return SendResult(success=True, message_id=message_id)
+        return SendResult(success=False, error="simulated edit failure")
+
+
 class FlakyProgressCaptureAdapter(ProgressCaptureAdapter):
     """Progress adapter that can fail selected edit attempts."""
 
@@ -165,7 +308,7 @@ class FlakyProgressCaptureAdapter(ProgressCaptureAdapter):
         )
         return SendResult(success=True, message_id=f"progress-{self._send_counter}")
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content, *, finalize=False) -> SendResult:
         self.edits.append(
             {
                 "chat_id": chat_id,
@@ -346,6 +489,339 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     ]
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_lifecycle_status_stays_in_originating_topic(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = LifecycleStatusAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-status",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="orig-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == [
+        {
+            "chat_id": "-1001",
+            "content": "🗜️ Context compacted; prior work is preserved in the handoff summary.",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_compression_status_reuses_single_message_per_compression(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CompressionLifecycleAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-compress-once",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="orig-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == [
+        {
+            "chat_id": "-1001",
+            "content": "🗜️ Compressing context...",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        }
+    ]
+    assert adapter.edits == [
+        {
+            "chat_id": "-1001",
+            "message_id": "progress-1",
+            "content": "✅ Context compacted: 12 -> 5",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_second_compression_starts_a_new_notice_message(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TwoCompressionLifecycleAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-compress-twice",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="orig-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == [
+        {
+            "chat_id": "-1001",
+            "content": "🗜️ Compressing context...",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        },
+        {
+            "chat_id": "-1001",
+            "content": "🗜️ Compressing context again...",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        },
+    ]
+    assert adapter.edits == [
+        {
+            "chat_id": "-1001",
+            "message_id": "progress-1",
+            "content": "✅ Context compacted: 12 -> 5",
+        },
+        {
+            "chat_id": "-1001",
+            "message_id": "progress-2",
+            "content": "✅ Context compacted: 9 -> 4",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_compression_status_skips_started_notice_on_non_editing_platform(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CompressionLifecycleAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = NonEditingStatusAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-compress-no-edit",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="orig-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == [
+        {
+            "chat_id": "-1001",
+            "content": "✅ Context compacted: 12 -> 5",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_compression_status_finalizes_edit_when_adapter_requires_it(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CompressionLifecycleAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = FinalizeAwareStatusAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-compress-finalize",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="orig-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.edits == [
+        {
+            "chat_id": "-1001",
+            "message_id": "progress-1",
+            "content": "✅ Context compacted: 12 -> 5",
+            "finalize": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_compression_status_edit_failure_falls_back_and_resets_active_notice(monkeypatch, tmp_path):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TwoCompressionLifecycleAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = FlakyCompactionStatusAdapter(edit_results=[False, True], platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-compress-fallback",
+        session_key="agent:main:telegram:group:-1001:17585",
+        event_message_id="orig-1",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == [
+        {
+            "chat_id": "-1001",
+            "content": "🗜️ Compressing context...",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        },
+        {
+            "chat_id": "-1001",
+            "content": "✅ Context compacted: 12 -> 5",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        },
+        {
+            "chat_id": "-1001",
+            "content": "🗜️ Compressing context again...",
+            "reply_to": None,
+            "metadata": {
+                "thread_id": "17585",
+                "root_message_id": "orig-1",
+            },
+        },
+    ]
+    assert adapter.edits == [
+        {
+            "chat_id": "-1001",
+            "message_id": "progress-1",
+            "content": "✅ Context compacted: 12 -> 5",
+            "finalize": False,
+        },
+        {
+            "chat_id": "-1001",
+            "message_id": "progress-3",
+            "content": "✅ Context compacted: 9 -> 4",
+            "finalize": False,
+        },
+    ]
 
 
 @pytest.mark.asyncio

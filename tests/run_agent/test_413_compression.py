@@ -101,6 +101,79 @@ def agent():
         return a
 
 
+class TestAutoCompactionNotice:
+    def test_emit_auto_compaction_notice_skips_when_disabled(self):
+        agent = AIAgent.__new__(AIAgent)
+        agent._auto_compaction_notice_enabled = False
+        agent._auto_compaction_notice_template = "ignored"
+        agent._emit_status = MagicMock()
+
+        agent._emit_auto_compaction_notice(12, 5)
+
+        agent._emit_status.assert_not_called()
+
+    def test_emit_auto_compaction_notice_formats_template(self):
+        agent = AIAgent.__new__(AIAgent)
+        agent._auto_compaction_notice_enabled = True
+        agent._auto_compaction_notice_template = (
+            "Compacted {before_count}->{after_count}; saved {saved_messages}."
+        )
+        agent._emit_status = MagicMock()
+
+        agent._emit_auto_compaction_notice(12, 5)
+
+        agent._emit_status.assert_called_once_with(
+            "Compacted 12->5; saved 7.",
+            event_type="compression.completed",
+            payload={
+                "message": "Compacted 12->5; saved 7.",
+                "before_count": 12,
+                "after_count": 5,
+                "saved_messages": 7,
+                "compression_count": 0,
+                "failed": False,
+            },
+        )
+
+    def test_compress_context_emits_started_and_completed_status_events(self):
+        agent = AIAgent.__new__(AIAgent)
+        agent.log_prefix = ""
+        agent.session_id = "sess"
+        agent.model = "test/model"
+        agent.flush_memories = MagicMock()
+        agent._memory_manager = None
+        agent._todo_store = SimpleNamespace(format_for_injection=lambda: "")
+        agent._invalidate_system_prompt = MagicMock()
+        agent._build_system_prompt = MagicMock(return_value="rebuilt system")
+        agent._session_db = None
+        agent.context_compressor = SimpleNamespace(
+            compress=MagicMock(return_value=[{"role": "user", "content": "summary"}]),
+            compression_count=1,
+            last_prompt_tokens=0,
+            last_completion_tokens=0,
+        )
+        agent._auto_compaction_notice_enabled = True
+        agent._auto_compaction_notice_template = "Compacted {before_count}->{after_count}"
+        agent._emit_status = MagicMock()
+        agent._vprint = MagicMock()
+
+        compressed, new_prompt = agent._compress_context(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ],
+            "system prompt",
+            emit_user_notice=True,
+        )
+
+        assert compressed == [{"role": "user", "content": "summary"}]
+        assert new_prompt == "rebuilt system"
+        assert agent._emit_status.call_args_list == [
+            (("🗜️ Compressing context...",), {"event_type": "compression.started", "payload": {"message": "🗜️ Compressing context...", "before_count": 2}}),
+            (("Compacted 2->1",), {"event_type": "compression.completed", "payload": {"message": "Compacted 2->1", "before_count": 2, "after_count": 1, "saved_messages": 1, "compression_count": 1, "failed": False}}),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -137,6 +210,32 @@ class TestHTTP413Compression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
         assert result["final_response"] == "Success after compression"
+
+    def test_413_compression_requests_user_notice_when_enabled(self, agent):
+        err_413 = _make_413_error()
+        ok_resp = _mock_response(content="Recovered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [err_413, ok_resp]
+        agent._auto_compaction_notice_enabled = True
+
+        prefill = [
+            {"role": "user", "content": "previous question"},
+            {"role": "assistant", "content": "previous answer"},
+        ]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "compressed prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=prefill)
+
+        assert result["completed"] is True
+        assert mock_compress.call_args.kwargs["emit_user_notice"] is True
 
     def test_413_not_treated_as_generic_4xx(self, agent):
         """413 must NOT hit the generic 4xx abort path; it should attempt compression."""
@@ -461,6 +560,38 @@ class TestPreflightCompression:
         assert result["completed"] is True
         assert result["final_response"] == "After preflight"
 
+    def test_preflight_compression_requests_user_notice_when_enabled(self, agent):
+        agent.compression_enabled = True
+        agent._auto_compaction_notice_enabled = True
+        agent.context_compressor.context_length = 2000
+        agent.context_compressor.threshold_tokens = 200
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message number {i} with some extra text padding"})
+            big_history.append({"role": "assistant", "content": f"Response number {i} with extra padding here"})
+
+        ok_resp = _mock_response(content="After preflight", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        with (
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [
+                    {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "new system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        assert result["completed"] is True
+        assert mock_compress.call_args_list[0].kwargs["emit_user_notice"] is True
+
     def test_no_preflight_when_under_threshold(self, agent):
         """When history fits within context, no preflight compression needed."""
         agent.compression_enabled = True
@@ -552,6 +683,48 @@ class TestToolResultPreflightCompression:
 
         mock_compress.assert_called_once()
         assert result["completed"] is True
+
+    def test_tool_result_compression_requests_user_notice_when_enabled(self, agent):
+        agent.compression_enabled = True
+        agent._auto_compaction_notice_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 130_000
+        agent.context_compressor.last_prompt_tokens = 130_000
+        agent.context_compressor.last_completion_tokens = 5_000
+
+        tc = SimpleNamespace(
+            id="tc1",
+            type="function",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"test"}'),
+        )
+        tool_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            tool_calls=[tc],
+            usage={"prompt_tokens": 130_000, "completion_tokens": 5_000, "total_tokens": 135_000},
+        )
+        ok_resp = _mock_response(
+            content="Done after compression",
+            finish_reason="stop",
+            usage={"prompt_tokens": 50_000, "completion_tokens": 100, "total_tokens": 50_100},
+        )
+        agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="x" * 100_000),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "hello"}],
+                "compressed prompt",
+            )
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert mock_compress.call_args.kwargs["emit_user_notice"] is True
 
     def test_anthropic_prompt_too_long_safety_net(self, agent):
         """Anthropic 'prompt is too long' error triggers compression as safety net."""

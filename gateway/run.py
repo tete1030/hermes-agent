@@ -9853,16 +9853,84 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id, "root_message_id": event_message_id} if _progress_thread_id else None
+        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        if _status_thread_metadata is not None and event_message_id:
+            _status_thread_metadata["root_message_id"] = event_message_id
+        _status_supports_edit = bool(
+            _status_adapter
+            and getattr(
+                _status_adapter,
+                "SUPPORTS_MESSAGE_EDITING",
+                type(_status_adapter).edit_message is not BasePlatformAdapter.edit_message,
+            )
+            and type(_status_adapter).edit_message is not BasePlatformAdapter.edit_message
+        )
+        _active_compaction_notice_id = None
 
-        def _status_callback_sync(event_type: str, message: str) -> None:
+        def _status_text(payload) -> str:
+            if isinstance(payload, dict):
+                text = payload.get("message")
+                return str(text) if text is not None else str(payload)
+            return str(payload)
+
+        def _status_send_sync(content: str):
+            future = asyncio.run_coroutine_threadsafe(
+                _status_adapter.send(
+                    _status_chat_id,
+                    content,
+                    metadata=_status_thread_metadata,
+                ),
+                _loop_for_step,
+            )
+            return future.result(timeout=15)
+
+        def _status_edit_sync(message_id: str, content: str, *, finalize: bool = False):
+            future = asyncio.run_coroutine_threadsafe(
+                _status_adapter.edit_message(
+                    chat_id=_status_chat_id,
+                    message_id=message_id,
+                    content=content,
+                    finalize=finalize,
+                ),
+                _loop_for_step,
+            )
+            return future.result(timeout=15)
+
+        def _status_callback_sync(event_type: str, message) -> None:
+            nonlocal _active_compaction_notice_id
             if not _status_adapter or not _run_still_current():
                 return
             try:
+                content = _status_text(message)
+                if event_type == "compression.started":
+                    if not _status_supports_edit:
+                        return
+                    if _active_compaction_notice_id:
+                        result = _status_edit_sync(_active_compaction_notice_id, content)
+                        if result.success:
+                            return
+                    result = _status_send_sync(content)
+                    if result.success and result.message_id:
+                        _active_compaction_notice_id = result.message_id
+                    return
+                if event_type == "compression.completed":
+                    if _status_supports_edit and _active_compaction_notice_id:
+                        result = _status_edit_sync(
+                            _active_compaction_notice_id,
+                            content,
+                            finalize=bool(getattr(_status_adapter, "REQUIRES_EDIT_FINALIZE", False)),
+                        )
+                        if not result.success:
+                            _status_send_sync(content)
+                        _active_compaction_notice_id = None
+                        return
+                    _status_send_sync(content)
+                    _active_compaction_notice_id = None
+                    return
                 asyncio.run_coroutine_threadsafe(
                     _status_adapter.send(
                         _status_chat_id,
-                        message,
+                        content,
                         metadata=_status_thread_metadata,
                     ),
                     _loop_for_step,

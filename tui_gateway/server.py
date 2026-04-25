@@ -225,6 +225,17 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     )
 
 
+def _status_text_payload(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        message = value.get("message")
+        if message is None:
+            return None if not value else str(value)
+        return str(message)
+    return str(value)
+
+
 def _estimate_image_tokens(width: int, height: int) -> int:
     """Very rough UI estimate for image prompt cost.
 
@@ -952,7 +963,9 @@ def _agent_cbs(sid: str) -> dict:
         thinking_callback=lambda text: _emit("thinking.delta", sid, {"text": text}),
         reasoning_callback=lambda text: _emit("reasoning.delta", sid, {"text": text}),
         status_callback=lambda kind, text=None: _status_update(
-            sid, str(kind), None if text is None else str(text)
+            sid,
+            str(kind),
+            _status_text_payload(text),
         ),
         clarify_callback=lambda q, c: _block(
             "clarify.request", sid, {"question": q, "choices": c}

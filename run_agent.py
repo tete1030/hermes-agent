@@ -1570,6 +1570,18 @@ class AIAgent:
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        self._auto_compaction_notice_enabled = str(
+            _compression_cfg.get("notify_user", False)
+        ).lower() in ("true", "1", "yes")
+        _auto_notice_template = _compression_cfg.get(
+            "notify_message",
+            "🗜️ Context compacted; prior work is preserved in the handoff summary.",
+        )
+        if not isinstance(_auto_notice_template, str) or not _auto_notice_template.strip():
+            _auto_notice_template = (
+                "🗜️ Context compacted; prior work is preserved in the handoff summary."
+            )
+        self._auto_compaction_notice_template = _auto_notice_template
 
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
@@ -2139,12 +2151,13 @@ class AIAgent:
             and getattr(self, "platform", "") == "cli"
         )
 
-    def _emit_status(self, message: str) -> None:
-        """Emit a lifecycle status message to both CLI and gateway channels.
+    def _emit_status(self, message: str, *, event_type: str = "lifecycle", payload: Any = None) -> None:
+        """Emit a status message to both CLI and gateway channels.
 
-        CLI users see the message via ``_vprint(force=True)`` so it is always
-        visible regardless of verbose/quiet mode.  Gateway consumers receive
-        it through ``status_callback("lifecycle", ...)``.
+        CLI users always see the human-readable ``message`` via ``_vprint``.
+        Gateway consumers receive ``status_callback(event_type, payload)`` for
+        structured events, falling back to the plain message when no explicit
+        payload is supplied.
 
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
@@ -2155,9 +2168,72 @@ class AIAgent:
             pass
         if self.status_callback:
             try:
-                self.status_callback("lifecycle", message)
+                self.status_callback(event_type, message if payload is None else payload)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
+
+    def _emit_auto_compaction_started(self, before_count: int) -> None:
+        """Emit the start of an automatic compaction cycle."""
+        if not getattr(self, "_auto_compaction_notice_enabled", False):
+            return
+        message = "🗜️ Compressing context..."
+        self._emit_status(
+            message,
+            event_type="compression.started",
+            payload={
+                "message": message,
+                "before_count": before_count,
+            },
+        )
+
+    def _emit_auto_compaction_notice(
+        self,
+        before_count: int,
+        after_count: int,
+        *,
+        failed: bool = False,
+    ) -> None:
+        """Emit the terminal notice for an automatic compaction cycle."""
+        if not getattr(self, "_auto_compaction_notice_enabled", False):
+            return
+
+        _compressor = getattr(self, "context_compressor", None)
+        values = {
+            "before_count": before_count,
+            "after_count": after_count,
+            "saved_messages": max(before_count - after_count, 0),
+            "compression_count": int(getattr(_compressor, "compression_count", 0) or 0),
+        }
+
+        if failed:
+            message = "⚠️ Context compression failed; continuing without compaction."
+        elif after_count >= before_count:
+            message = "ℹ️ Context compression finished without reducing message count."
+        else:
+            template = getattr(
+                self,
+                "_auto_compaction_notice_template",
+                "🗜️ Context compacted; prior work is preserved in the handoff summary.",
+            )
+
+            class _SafeFormatDict(dict):
+                def __missing__(self, key):
+                    return "{" + key + "}"
+
+            try:
+                message = str(template).format_map(_SafeFormatDict(values))
+            except Exception:
+                message = str(template)
+
+        self._emit_status(
+            message,
+            event_type="compression.completed",
+            payload={
+                "message": message,
+                **values,
+                "failed": failed,
+            },
+        )
 
     def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
@@ -7544,13 +7620,26 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
+    def _compress_context(
+        self,
+        messages: list,
+        system_message: str,
+        *,
+        approx_tokens: int = None,
+        task_id: str = "default",
+        focus_topic: str = None,
+        emit_user_notice: bool = False,
+    ) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
         Args:
             focus_topic: Optional focus string for guided compression — the
                 summariser will prioritise preserving information related to
                 this topic.  Inspired by Claude Code's ``/compact <focus>``.
+            emit_user_notice: When True, send the optional configured
+                user-visible auto-compaction notice after a successful
+                reduction. Manual ``/compress`` flows leave this False because
+                they already return explicit compression feedback.
 
         Returns:
             (compressed_messages, new_system_prompt) tuple
@@ -7572,7 +7661,22 @@ class AIAgent:
             except Exception:
                 pass
 
-        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+        if emit_user_notice:
+            self._emit_auto_compaction_started(_pre_msg_count)
+        try:
+            compressed = self.context_compressor.compress(
+                messages,
+                current_tokens=approx_tokens,
+                focus_topic=focus_topic,
+            )
+        except Exception:
+            if emit_user_notice:
+                self._emit_auto_compaction_notice(
+                    _pre_msg_count,
+                    _pre_msg_count,
+                    failed=True,
+                )
+            raise
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -7614,6 +7718,8 @@ class AIAgent:
 
         # Warn on repeated compressions (quality degrades with each pass)
         _cc = self.context_compressor.compression_count
+        if emit_user_notice:
+            self._emit_auto_compaction_notice(_pre_msg_count, len(compressed))
         if _cc >= 2:
             self._vprint(
                 f"{self.log_prefix}⚠️  Session compressed {_cc} times — "
@@ -8899,6 +9005,7 @@ class AIAgent:
                     messages, active_system_prompt = self._compress_context(
                         messages, system_message, approx_tokens=_preflight_tokens,
                         task_id=effective_task_id,
+                        emit_user_notice=True,
                     )
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
@@ -10411,6 +10518,7 @@ class AIAgent:
                                 messages, system_message,
                                 approx_tokens=approx_tokens,
                                 task_id=effective_task_id,
+                                emit_user_notice=True,
                             )
                             # Compression created a new session — clear history
                             # so _flush_messages_to_session_db writes compressed
@@ -10508,6 +10616,7 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            emit_user_notice=True,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -10665,6 +10774,7 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            emit_user_notice=True,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -11390,6 +11500,7 @@ class AIAgent:
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
+                            emit_user_notice=True,
                         )
                         # Compression created a new session — clear history so
                         # _flush_messages_to_session_db writes compressed messages

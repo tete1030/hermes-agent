@@ -83,6 +83,18 @@ def test_status_callback_accepts_single_message_argument():
     )
 
 
+def test_status_callback_uses_message_field_from_structured_payload():
+    with patch("tui_gateway.server._emit") as emit:
+        cb = server._agent_cbs("sid")["status_callback"]
+        cb("compression.started", {"message": "🗜️ Compressing context...", "before_count": 12})
+
+    emit.assert_called_once_with(
+        "status.update",
+        "sid",
+        {"kind": "compression.started", "text": "🗜️ Compressing context..."},
+    )
+
+
 def _session(agent=None, **extra):
     return {
         "agent": agent if agent is not None else types.SimpleNamespace(),
