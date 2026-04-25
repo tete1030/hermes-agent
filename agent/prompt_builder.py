@@ -1021,6 +1021,10 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+    source_aliases = get_skills_source_aliases()
+    source_alias_items = tuple(
+        sorted((str(path), str(alias)) for path, alias in source_aliases.items())
+    )
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1028,6 +1032,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        source_alias_items,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1036,7 +1041,6 @@ def build_skills_system_prompt(
             return cached
 
     disabled = get_disabled_skill_names()
-    source_aliases = get_skills_source_aliases()
     local_source_alias = get_skill_source_alias(skills_dir, source_aliases)
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────

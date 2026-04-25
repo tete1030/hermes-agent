@@ -4335,6 +4335,16 @@ class FeishuAdapter(BasePlatformAdapter):
                 or metadata.get("root_message_id")
             )
         reply_in_thread = bool((metadata or {}).get("thread_id"))
+
+        # If no explicit reply target was provided, reuse the thread root unless a
+        # caller is intentionally degrading to a plain chat message.
+        if (
+            not effective_reply_to
+            and metadata
+            and not metadata.get("_disable_root_reply_fallback")
+        ):
+            effective_reply_to = metadata.get("root_message_id")
+
         if effective_reply_to:
             logger.debug(
                 "[Feishu] Sending reply to %s in chat %s (reply_in_thread=%s)",
@@ -4502,7 +4512,8 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         last_error: Optional[Exception] = None
-        active_reply_to = reply_to
+        active_reply_to = reply_to or ((metadata or {}).get("root_message_id"))
+        active_metadata = dict(metadata or {}) if metadata else None
         for attempt in range(_FEISHU_SEND_ATTEMPTS):
             try:
                 response = await self._send_raw_message(
@@ -4510,7 +4521,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     msg_type=msg_type,
                     payload=payload,
                     reply_to=active_reply_to,
-                    metadata=metadata,
+                    metadata=active_metadata,
                 )
                 # If replying to a message failed because it was withdrawn or not found,
                 # fall back to posting a new message directly to the chat.
@@ -4534,12 +4545,15 @@ class FeishuAdapter(BasePlatformAdapter):
                             chat_id,
                         )
                         active_reply_to = None
+                        if active_metadata is not None:
+                            active_metadata = dict(active_metadata)
+                            active_metadata["_disable_root_reply_fallback"] = True
                         response = await self._send_raw_message(
                             chat_id=chat_id,
                             msg_type=msg_type,
                             payload=payload,
                             reply_to=None,
-                            metadata=metadata,
+                            metadata=active_metadata,
                         )
                 return response
             except Exception as exc:

@@ -372,6 +372,26 @@ class TestBuildSkillsSystemPrompt:
         second = build_skills_system_prompt()
         assert "cached-skill" not in second
 
+    def test_rebuilds_prompt_when_source_aliases_change(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "cached-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: cached-skill\ndescription: Cached skill\n---\n"
+        )
+
+        monkeypatch.setattr("agent.prompt_builder.get_skills_source_aliases", lambda: {})
+        first = build_skills_system_prompt()
+        assert "cached-skill" in first
+        assert "[source: local]" in first
+
+        monkeypatch.setattr(
+            "agent.prompt_builder.get_skills_source_aliases",
+            lambda: {tmp_path / "skills": "shared"},
+        )
+        second = build_skills_system_prompt()
+        assert "[source: shared]" in second
+
     def test_includes_setup_needed_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("MISSING_API_KEY_XYZ", raising=False)
