@@ -764,6 +764,10 @@ DEFAULT_CONFIG = {
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
+        # Optional user-visible notice after automatic compaction. Manual /compress
+        # already returns its own feedback, so this is for auto-compaction paths.
+        "notify_user": False,
+        "notify_message": "🗜️ Context compacted; prior work is preserved in the handoff summary.",
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt

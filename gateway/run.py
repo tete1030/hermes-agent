@@ -15404,32 +15404,113 @@ class GatewayRunner:
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+        _status_supports_edit = bool(
+            _status_adapter
+            and getattr(
+                _status_adapter,
+                "SUPPORTS_MESSAGE_EDITING",
+                type(_status_adapter).edit_message is not BasePlatformAdapter.edit_message,
+            )
+            and type(_status_adapter).edit_message is not BasePlatformAdapter.edit_message
+        )
+        _active_compaction_notice_id = None
 
-        def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter or not _run_still_current():
-                return
-            _fut = safe_schedule_threadsafe(
+        def _status_text(payload) -> str:
+            if isinstance(payload, dict):
+                text = payload.get("message")
+                return str(text) if text is not None else str(payload)
+            return str(payload)
+
+        def _status_send_sync(content: str):
+            future = asyncio.run_coroutine_threadsafe(
                 _status_adapter.send(
                     _status_chat_id,
-                    message,
+                    content,
                     metadata=_status_thread_metadata,
                 ),
                 _loop_for_step,
-                logger=logger,
-                log_message=f"status_callback ({event_type}) scheduling error",
             )
-            if _fut is None:
+            return future.result(timeout=15)
+
+        def _status_edit_sync(message_id: str, content: str, *, finalize: bool = False):
+            future = asyncio.run_coroutine_threadsafe(
+                _status_adapter.edit_message(
+                    chat_id=_status_chat_id,
+                    message_id=message_id,
+                    content=content,
+                    finalize=finalize,
+                ),
+                _loop_for_step,
+            )
+            return future.result(timeout=15)
+
+        def _status_callback_sync(event_type: str, message) -> None:
+            nonlocal _active_compaction_notice_id
+            if not _status_adapter or not _run_still_current():
                 return
-            if _cleanup_progress:
-                def _track_status_id(fut) -> None:
-                    try:
-                        res = fut.result()
-                    except Exception:
+            try:
+                content = _status_text(message)
+                if event_type == "compression.started":
+                    if not _status_supports_edit:
                         return
-                    mid = getattr(res, "message_id", None)
-                    if getattr(res, "success", False) and mid:
-                        _cleanup_msg_ids.append(str(mid))
-                _fut.add_done_callback(_track_status_id)
+                    if _active_compaction_notice_id:
+                        result = _status_edit_sync(_active_compaction_notice_id, content)
+                        if result.success:
+                            return
+                    result = _status_send_sync(content)
+                    if result.success and result.message_id:
+                        _active_compaction_notice_id = result.message_id
+                    return
+                if event_type == "compression.completed":
+                    if _status_supports_edit and _active_compaction_notice_id:
+                        result = _status_edit_sync(
+                            _active_compaction_notice_id,
+                            content,
+                            finalize=bool(getattr(_status_adapter, "REQUIRES_EDIT_FINALIZE", False)),
+                        )
+                        if not result.success:
+                            fallback = _status_send_sync(content)
+                            if (
+                                _cleanup_progress
+                                and getattr(fallback, "success", False)
+                                and getattr(fallback, "message_id", None)
+                            ):
+                                _cleanup_msg_ids.append(str(fallback.message_id))
+                        _active_compaction_notice_id = None
+                        return
+                    fallback = _status_send_sync(content)
+                    if (
+                        _cleanup_progress
+                        and getattr(fallback, "success", False)
+                        and getattr(fallback, "message_id", None)
+                    ):
+                        _cleanup_msg_ids.append(str(fallback.message_id))
+                    _active_compaction_notice_id = None
+                    return
+                _fut = safe_schedule_threadsafe(
+                    _status_adapter.send(
+                        _status_chat_id,
+                        content,
+                        metadata=_status_thread_metadata,
+                    ),
+                    _loop_for_step,
+                    logger=logger,
+                    log_message=f"status_callback ({event_type}) scheduling error",
+                )
+                if _fut is None:
+                    return
+                if _cleanup_progress:
+                    def _track_status_id(fut) -> None:
+                        try:
+                            res = fut.result()
+                        except Exception:
+                            return
+                        mid = getattr(res, "message_id", None)
+                        if getattr(res, "success", False) and mid:
+                            _cleanup_msg_ids.append(str(mid))
+                    _fut.add_done_callback(_track_status_id)
+            except Exception as _e:
+                logger.debug("status_callback error (%s): %s", event_type, _e)
 
         def run_sync():
             # The conditional re-assignment of `message` further below

@@ -2144,13 +2144,23 @@ class AIAgent:
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
         # protect_first_n is the number of non-system messages to protect at
         # the head, in addition to the system prompt (which is always
-        # implicitly protected by the compressor).  Floor at 0 — a value of
-        # 0 means "preserve only the system prompt + summary + tail", which
-        # is a legitimate (and common) configuration for long-running
-        # rolling-compaction sessions.
+        # implicitly protected by the compressor). Floor at 0 so long-running
+        # rolling-compaction sessions can preserve only the summary + tail.
         compression_protect_first = max(
             0, int(_compression_cfg.get("protect_first_n", 3))
         )
+        self._auto_compaction_notice_enabled = str(
+            _compression_cfg.get("notify_user", False)
+        ).lower() in ("true", "1", "yes")
+        _auto_notice_template = _compression_cfg.get(
+            "notify_message",
+            "🗜️ Context compacted; prior work is preserved in the handoff summary.",
+        )
+        if not isinstance(_auto_notice_template, str) or not _auto_notice_template.strip():
+            _auto_notice_template = (
+                "🗜️ Context compacted; prior work is preserved in the handoff summary."
+            )
+        self._auto_compaction_notice_template = _auto_notice_template
 
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
@@ -2911,12 +2921,13 @@ class AIAgent:
             and getattr(self, "platform", "") == "cli"
         )
 
-    def _emit_status(self, message: str) -> None:
-        """Emit a lifecycle status message to both CLI and gateway channels.
+    def _emit_status(self, message: str, *, event_type: str = "lifecycle", payload: Any = None) -> None:
+        """Emit a status message to both CLI and gateway channels.
 
-        CLI users see the message via ``_vprint(force=True)`` so it is always
-        visible regardless of verbose/quiet mode.  Gateway consumers receive
-        it through ``status_callback("lifecycle", ...)``.
+        CLI users always see the human-readable ``message`` via ``_vprint``.
+        Gateway consumers receive ``status_callback(event_type, payload)`` for
+        structured events, falling back to the plain message when no explicit
+        payload is supplied.
 
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
@@ -2927,7 +2938,7 @@ class AIAgent:
             pass
         if self.status_callback:
             try:
-                self.status_callback("lifecycle", message)
+                self.status_callback(event_type, message if payload is None else payload)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
@@ -3220,6 +3231,69 @@ class AIAgent:
         if len(detail) > 220:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
+
+    def _emit_auto_compaction_started(self, before_count: int) -> None:
+        """Emit the start of an automatic compaction cycle."""
+        if not getattr(self, "_auto_compaction_notice_enabled", False):
+            return
+        message = "🗜️ Compressing context..."
+        self._emit_status(
+            message,
+            event_type="compression.started",
+            payload={
+                "message": message,
+                "before_count": before_count,
+            },
+        )
+
+    def _emit_auto_compaction_notice(
+        self,
+        before_count: int,
+        after_count: int,
+        *,
+        failed: bool = False,
+    ) -> None:
+        """Emit the terminal notice for an automatic compaction cycle."""
+        if not getattr(self, "_auto_compaction_notice_enabled", False):
+            return
+
+        _compressor = getattr(self, "context_compressor", None)
+        values = {
+            "before_count": before_count,
+            "after_count": after_count,
+            "saved_messages": max(before_count - after_count, 0),
+            "compression_count": int(getattr(_compressor, "compression_count", 0) or 0),
+        }
+
+        if failed:
+            message = "⚠️ Context compression failed; continuing without compaction."
+        elif after_count >= before_count:
+            message = "ℹ️ Context compression finished without reducing message count."
+        else:
+            template = getattr(
+                self,
+                "_auto_compaction_notice_template",
+                "🗜️ Context compacted; prior work is preserved in the handoff summary.",
+            )
+
+            class _SafeFormatDict(dict):
+                def __missing__(self, key):
+                    return "{" + key + "}"
+
+            try:
+                message = str(template).format_map(_SafeFormatDict(values))
+            except Exception:
+                message = str(template)
+
+        self._emit_status(
+            message,
+            event_type="compression.completed",
+            payload={
+                "message": message,
+                **values,
+                "failed": failed,
+            },
+        )
 
     def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
@@ -10669,13 +10743,221 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
+    def flush_memories(self, messages: list = None, min_turns: int = None):
+        """Give the model one turn to persist memories before context is lost.
+
+        Called before compression, session reset, or CLI exit. Injects a flush
+        message, makes one API call, executes any memory tool calls, then
+        strips all flush artifacts from the message list.
+
+        Args:
+            messages: The current conversation messages. If None, uses
+                      self._session_messages (last run_conversation state).
+            min_turns: Minimum user turns required to trigger the flush.
+                       None = use config value (flush_min_turns).
+                       0 = always flush (used for compression).
+        """
+        if self._memory_flush_min_turns == 0 and min_turns is None:
+            return
+        if "memory" not in self.valid_tool_names or not self._memory_store:
+            return
+        effective_min = min_turns if min_turns is not None else self._memory_flush_min_turns
+        if self._user_turn_count < effective_min:
+            return
+
+        if messages is None:
+            messages = getattr(self, '_session_messages', None)
+        if not messages or len(messages) < 3:
+            return
+
+        flush_content = (
+            "[System: The session is being compressed. "
+            "Save anything worth remembering — prioritize user preferences, "
+            "corrections, and recurring patterns over task-specific details.]"
+        )
+        _sentinel = f"__flush_{id(self)}_{time.monotonic()}"
+        flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
+        messages.append(flush_msg)
+
+        try:
+            # Build API messages for the flush call
+            _needs_sanitize = self._should_sanitize_tool_calls()
+            api_messages = []
+            for msg in messages:
+                api_msg = msg.copy()
+                self._copy_reasoning_content_for_api(msg, api_msg)
+                api_msg.pop("reasoning", None)
+                api_msg.pop("finish_reason", None)
+                api_msg.pop("_flush_sentinel", None)
+                api_msg.pop("_thinking_prefill", None)
+                if _needs_sanitize:
+                    self._sanitize_tool_calls_for_strict_api(api_msg)
+                api_messages.append(api_msg)
+
+            if self._cached_system_prompt:
+                api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
+
+            # Make one API call with only the memory tool available
+            memory_tool_def = None
+            for t in (self.tools or []):
+                if t.get("function", {}).get("name") == "memory":
+                    memory_tool_def = t
+                    break
+
+            if not memory_tool_def:
+                messages.pop()  # remove flush msg
+                return
+
+            # Use auxiliary client for the flush call when available --
+            # it's cheaper and avoids Codex Responses API incompatibility.
+            from agent.auxiliary_client import (
+                call_llm as _call_llm,
+                _fixed_temperature_for_model,
+                OMIT_TEMPERATURE,
+            )
+            _aux_available = True
+            # Kimi models manage temperature server-side — omit it entirely.
+            # Other models with a fixed contract get that value; everyone else
+            # gets the historical 0.3 default.
+            _fixed_temp = _fixed_temperature_for_model(self.model, self.base_url)
+            _omit_temperature = _fixed_temp is OMIT_TEMPERATURE
+            if _omit_temperature:
+                _flush_temperature = None
+            elif _fixed_temp is not None:
+                _flush_temperature = _fixed_temp
+            else:
+                _flush_temperature = 0.3
+            try:
+                response = _call_llm(
+                    task="flush_memories",
+                    messages=api_messages,
+                    tools=[memory_tool_def],
+                    temperature=_flush_temperature,
+                    max_tokens=5120,
+                    # timeout resolved from auxiliary.flush_memories.timeout config
+                )
+            except RuntimeError:
+                _aux_available = False
+                response = None
+
+            if not _aux_available and self.api_mode == "codex_responses":
+                # No auxiliary client -- use the Codex Responses path directly
+                codex_kwargs = self._build_api_kwargs(api_messages)
+                codex_kwargs["tools"] = self._get_transport().convert_tools([memory_tool_def])
+                if _flush_temperature is not None:
+                    codex_kwargs["temperature"] = _flush_temperature
+                else:
+                    codex_kwargs.pop("temperature", None)
+                if "max_output_tokens" in codex_kwargs:
+                    codex_kwargs["max_output_tokens"] = 5120
+                response = self._run_codex_stream(codex_kwargs)
+            elif not _aux_available and self.api_mode == "anthropic_messages":
+                # Native Anthropic — use the transport for kwargs
+                _tflush = self._get_transport()
+                ant_kwargs = _tflush.build_kwargs(
+                    model=self.model, messages=api_messages,
+                    tools=[memory_tool_def], max_tokens=5120,
+                    reasoning_config=None,
+                    preserve_dots=self._anthropic_preserve_dots(),
+                )
+                response = self._anthropic_messages_create(ant_kwargs)
+            elif not _aux_available:
+                api_kwargs = {
+                    "model": self.model,
+                    "messages": api_messages,
+                    "tools": [memory_tool_def],
+                    **self._max_tokens_param(5120),
+                }
+                if _flush_temperature is not None:
+                    api_kwargs["temperature"] = _flush_temperature
+                from agent.auxiliary_client import _get_task_timeout
+                response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(
+                    **api_kwargs, timeout=_get_task_timeout("flush_memories")
+                )
+
+            # Extract tool calls from the response, handling all API formats
+            tool_calls = []
+            if self.api_mode == "codex_responses" and not _aux_available:
+                _ct_flush = self._get_transport()
+                _cnr_flush = _ct_flush.normalize_response(response)
+                if _cnr_flush and _cnr_flush.tool_calls:
+                    tool_calls = [
+                        SimpleNamespace(
+                            id=tc.id, type="function",
+                            function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
+                        ) for tc in _cnr_flush.tool_calls
+                    ]
+            elif self.api_mode == "anthropic_messages" and not _aux_available:
+                _tfn = self._get_transport()
+                _flush_result = _tfn.normalize_response(response, strip_tool_prefix=self._is_anthropic_oauth)
+                if _flush_result and _flush_result.tool_calls:
+                    tool_calls = [
+                        SimpleNamespace(
+                            id=tc.id, type="function",
+                            function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
+                        ) for tc in _flush_result.tool_calls
+                    ]
+            elif self.api_mode in ("chat_completions", "bedrock_converse"):
+                # chat_completions / bedrock — normalize through transport
+                _flush_result = self._get_transport().normalize_response(response)
+                if _flush_result.tool_calls:
+                    tool_calls = _flush_result.tool_calls
+            elif _aux_available and hasattr(response, "choices") and response.choices:
+                # Auxiliary client returned OpenAI-shaped response while main
+                # api_mode is codex/anthropic — extract tool_calls from .choices
+                _aux_msg = response.choices[0].message
+                if hasattr(_aux_msg, "tool_calls") and _aux_msg.tool_calls:
+                    tool_calls = _aux_msg.tool_calls
+
+            for tc in tool_calls:
+                if tc.function.name == "memory":
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        flush_target = args.get("target", "memory")
+                        from tools.memory_tool import memory_tool as _memory_tool
+                        _memory_tool(
+                            action=args.get("action"),
+                            target=flush_target,
+                            content=args.get("content"),
+                            old_text=args.get("old_text"),
+                            store=self._memory_store,
+                        )
+                        if not self.quiet_mode:
+                            print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
+                    except Exception as e:
+                        logger.debug("Memory flush tool call failed: %s", e)
+        except Exception as e:
+            logger.debug("Memory flush API call failed: %s", e)
+        finally:
+            # Strip flush artifacts: remove everything from the flush message onward.
+            # Use sentinel marker instead of identity check for robustness.
+            while messages and messages[-1].get("_flush_sentinel") != _sentinel:
+                messages.pop()
+                if not messages:
+                    break
+            if messages and messages[-1].get("_flush_sentinel") == _sentinel:
+                messages.pop()
+
+    def _compress_context(
+        self,
+        messages: list,
+        system_message: str,
+        *,
+        approx_tokens: int = None,
+        task_id: str = "default",
+        focus_topic: str = None,
+        emit_user_notice: bool = False,
+    ) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
         Args:
             focus_topic: Optional focus string for guided compression — the
                 summariser will prioritise preserving information related to
                 this topic.  Inspired by Claude Code's ``/compact <focus>``.
+            emit_user_notice: When True, send the optional configured
+                user-visible auto-compaction notice after a successful
+                reduction. Manual ``/compress`` flows leave this False because
+                they already return explicit compression feedback.
 
         Returns:
             (compressed_messages, new_system_prompt) tuple
@@ -10698,12 +10980,30 @@ class AIAgent:
             except Exception:
                 pass
 
+        if emit_user_notice:
+            self._emit_auto_compaction_started(_pre_msg_count)
         try:
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
-        except TypeError:
-            # Plugin context engine with strict signature that doesn't accept
-            # focus_topic — fall back to calling without it.
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+            try:
+                compressed = self.context_compressor.compress(
+                    messages,
+                    current_tokens=approx_tokens,
+                    focus_topic=focus_topic,
+                )
+            except TypeError:
+                # Plugin context engine with strict signatures may not accept
+                # focus_topic; fall back to the legacy call shape.
+                compressed = self.context_compressor.compress(
+                    messages,
+                    current_tokens=approx_tokens,
+                )
+        except Exception:
+            if emit_user_notice:
+                self._emit_auto_compaction_notice(
+                    _pre_msg_count,
+                    _pre_msg_count,
+                    failed=True,
+                )
+            raise
 
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
         if summary_error:
@@ -10714,14 +11014,9 @@ class AIAgent:
                     "Inserted a fallback context marker."
                 )
         else:
-            # No hard failure — but did the configured aux model error out
-            # and get recovered by retrying on main?  Surface that so users
-            # know their auxiliary.compression.model setting is broken even
-            # though compression succeeded.
             _aux_fail_model = getattr(self.context_compressor, "_last_aux_model_failure_model", None)
             _aux_fail_err = getattr(self.context_compressor, "_last_aux_model_failure_error", None)
             if _aux_fail_model:
-                # Dedup on (model, error) so we don't spam on every compaction
                 _aux_key = (_aux_fail_model, _aux_fail_err)
                 if getattr(self, "_last_aux_fallback_warning_key", None) != _aux_key:
                     self._last_aux_fallback_warning_key = _aux_key
@@ -10813,6 +11108,8 @@ class AIAgent:
 
         # Warn on repeated compressions (quality degrades with each pass)
         _cc = self.context_compressor.compression_count
+        if emit_user_notice:
+            self._emit_auto_compaction_notice(_pre_msg_count, len(compressed))
         if _cc >= 2:
             self._vprint(
                 f"{self.log_prefix}⚠️  Session compressed {_cc} times — "
@@ -12419,6 +12716,7 @@ class AIAgent:
                     messages, active_system_prompt = self._compress_context(
                         messages, system_message, approx_tokens=_preflight_tokens,
                         task_id=effective_task_id,
+                        emit_user_notice=True,
                     )
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
@@ -14281,6 +14579,7 @@ class AIAgent:
                                 messages, system_message,
                                 approx_tokens=approx_tokens,
                                 task_id=effective_task_id,
+                                emit_user_notice=True,
                             )
                             # Compression created a new session — clear history
                             # so _flush_messages_to_session_db writes compressed
@@ -14414,6 +14713,7 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            emit_user_notice=True,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -14571,6 +14871,7 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            emit_user_notice=True,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -15353,6 +15654,7 @@ class AIAgent:
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
+                            emit_user_notice=True,
                         )
                         # Compression created a new session — clear history so
                         # _flush_messages_to_session_db writes compressed messages
