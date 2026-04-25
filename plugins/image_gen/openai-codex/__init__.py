@@ -20,6 +20,7 @@ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -100,8 +101,6 @@ def _load_image_gen_config() -> Dict[str, Any]:
 
 def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     """Decide which tier to use and return ``(model_id, meta)``."""
-    import os
-
     env_override = os.environ.get("OPENAI_IMAGE_MODEL")
     if env_override and env_override in _MODELS:
         return env_override, _MODELS[env_override]
@@ -142,20 +141,74 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
+def _resolve_endpoint_auth() -> Dict[str, Any]:
+    """Resolve endpoint/auth details for image generation requests.
+
+    Default behavior remains Codex OAuth against ``_CODEX_BASE_URL``.
+    If ``image_gen.openai-codex.base_url`` is set to a non-Codex URL, we treat
+    it as a custom OpenAI-compatible endpoint (e.g. LiteLLM) and use
+    ``image_gen.openai-codex.api_key`` (fallback: ``OPENAI_API_KEY``).
+    """
+    cfg = _load_image_gen_config()
+    sub = cfg.get("openai-codex") if isinstance(cfg.get("openai-codex"), dict) else {}
+
+    raw_base_url = ""
+    raw_api_key = ""
+    if isinstance(sub, dict):
+        base_val = sub.get("base_url")
+        if isinstance(base_val, str):
+            raw_base_url = base_val.strip()
+        key_val = sub.get("api_key")
+        if isinstance(key_val, str):
+            raw_api_key = key_val.strip()
+
+    normalized_codex_base = _CODEX_BASE_URL.rstrip("/")
+    base_url = (raw_base_url or _CODEX_BASE_URL).strip().rstrip("/")
+    custom_endpoint = bool(raw_base_url) and base_url != normalized_codex_base
+
+    if custom_endpoint:
+        api_key = raw_api_key or os.environ.get("OPENAI_API_KEY", "").strip() or ""
+        return {
+            "mode": "custom_endpoint",
+            "base_url": base_url,
+            "api_key": api_key,
+            "default_headers": None,
+        }
+
+    token = _read_codex_access_token() or ""
+    headers = None
+    if token:
+        try:
+            from agent.auxiliary_client import _codex_cloudflare_headers
+
+            headers = _codex_cloudflare_headers(token)
+        except Exception as exc:
+            logger.debug("Could not build Codex cloudflare headers: %s", exc)
+
+    return {
+        "mode": "codex_oauth",
+        "base_url": normalized_codex_base,
+        "api_key": token,
+        "default_headers": headers,
+    }
+
+
 def _build_codex_client():
-    """Return an OpenAI client pointed at the ChatGPT/Codex backend, or None."""
-    token = _read_codex_access_token()
-    if not token:
+    """Return an OpenAI client for the resolved endpoint/auth settings, or None."""
+    settings = _resolve_endpoint_auth()
+    api_key = settings.get("api_key")
+    base_url = settings.get("base_url")
+    if not api_key or not base_url:
         return None
+
     try:
         import openai
-        from agent.auxiliary_client import _codex_cloudflare_headers
 
-        return openai.OpenAI(
-            api_key=token,
-            base_url=_CODEX_BASE_URL,
-            default_headers=_codex_cloudflare_headers(token),
-        )
+        kwargs: Dict[str, Any] = {"api_key": api_key, "base_url": base_url}
+        headers = settings.get("default_headers")
+        if isinstance(headers, dict) and headers:
+            kwargs["default_headers"] = headers
+        return openai.OpenAI(**kwargs)
     except Exception as exc:
         logger.debug("Could not build Codex image client: %s", exc)
         return None
@@ -231,7 +284,8 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         return "OpenAI (Codex auth)"
 
     def is_available(self) -> bool:
-        if not _read_codex_access_token():
+        settings = _resolve_endpoint_auth()
+        if not settings.get("api_key"):
             return False
         try:
             import openai  # noqa: F401
@@ -283,12 +337,21 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        if not _read_codex_access_token():
-            return error_response(
-                error=(
+        settings = _resolve_endpoint_auth()
+        if not settings.get("api_key"):
+            if settings.get("mode") == "custom_endpoint":
+                msg = (
+                    "image_gen.openai-codex.base_url is configured but no API key "
+                    "was found. Set image_gen.openai-codex.api_key or "
+                    "OPENAI_API_KEY."
+                )
+            else:
+                msg = (
                     "No Codex/ChatGPT OAuth credentials available. Run "
                     "`hermes auth codex` (or `hermes setup` → Codex) to sign in."
-                ),
+                )
+            return error_response(
+                error=msg,
                 error_type="auth_required",
                 provider="openai-codex",
                 aspect_ratio=aspect,
@@ -328,7 +391,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
             return error_response(
-                error=f"OpenAI image generation via Codex auth failed: {exc}",
+                error=f"OpenAI image generation request failed: {exc}",
                 error_type="api_error",
                 provider="openai-codex",
                 model=tier_id,
