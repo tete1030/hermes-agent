@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -108,16 +109,109 @@ class TestAvailability:
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: None)
         assert codex_plugin.OpenAICodexImageGenProvider().is_available() is False
 
+    def test_available_with_custom_endpoint_credentials(self, monkeypatch, tmp_path):
+        """A configured endpoint+key should make the provider available even
+        when no Codex OAuth token exists."""
+        import yaml
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({
+                "image_gen": {
+                    "openai-codex": {
+                        "base_url": "http://litellm.local/v1",
+                        "api_key": "litellm-key",
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: None)
+
+        fake_openai = SimpleNamespace()
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            assert codex_plugin.OpenAICodexImageGenProvider().is_available() is True
+
 
 # ── Generate ────────────────────────────────────────────────────────────────
 
 
 class TestGenerate:
+    def test_build_client_prefers_custom_endpoint_credentials(self, monkeypatch, tmp_path):
+        """Custom base URL + key should bypass Codex OAuth wiring."""
+        import yaml
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({
+                "image_gen": {
+                    "openai-codex": {
+                        "base_url": "http://litellm.local/v1",
+                        "api_key": "litellm-key",
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        captured = {}
+
+        def _openai_ctor(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        fake_openai = SimpleNamespace(OpenAI=_openai_ctor)
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            client = codex_plugin._build_codex_client()
+
+        assert client is not None
+        assert captured["api_key"] == "litellm-key"
+        assert captured["base_url"] == "http://litellm.local/v1"
+        assert "default_headers" not in captured
+
     def test_returns_auth_error_without_codex_token(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: None)
         result = provider.generate("a cat")
         assert result["success"] is False
         assert result["error_type"] == "auth_required"
+
+    def test_custom_endpoint_does_not_require_codex_token(self, provider, monkeypatch, tmp_path):
+        import yaml
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({
+                "image_gen": {
+                    "openai-codex": {
+                        "base_url": "http://litellm.local/v1",
+                        "api_key": "litellm-key",
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: None)
+
+        output_item = SimpleNamespace(
+            type="image_generation_call",
+            status="generating",
+            id="ig_test",
+            result=_b64_png(),
+        )
+        done_event = SimpleNamespace(type="response.output_item.done", item=output_item)
+        final_response = SimpleNamespace(output=[], status="completed", output_text="")
+
+        fake_client = SimpleNamespace(
+            responses=SimpleNamespace(
+                stream=lambda **kwargs: _FakeStream([done_event], final_response)
+            )
+        )
+        monkeypatch.setattr(codex_plugin, "_build_codex_client", lambda: fake_client)
+
+        result = provider.generate("a cat")
+        assert result["success"] is True
 
     def test_returns_invalid_argument_for_empty_prompt(self, provider, monkeypatch):
         monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
