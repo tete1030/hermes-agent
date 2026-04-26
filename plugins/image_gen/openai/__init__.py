@@ -1,24 +1,21 @@
 """OpenAI image generation backend.
 
-Exposes OpenAI's ``gpt-image-2`` model at three quality tiers as an
-:class:`ImageGenProvider` implementation. The tiers are implemented as
-three virtual model IDs so the ``hermes tools`` model picker and the
-``image_gen.model`` config key behave like any other multi-model backend:
+Primary model is ``gpt-image-2`` with optional ``quality`` control
+(``low``/``medium``/``high``).
 
-    gpt-image-2-low     ~15s   fastest, good for iteration
-    gpt-image-2-medium  ~40s   default — balanced
-    gpt-image-2-high    ~2min  slowest, highest fidelity
-
-All three hit the same underlying API model (``gpt-image-2``) with a
-different ``quality`` parameter. Output is base64 JSON → saved under
-``$HERMES_HOME/cache/images/``.
-
-Selection precedence (first hit wins):
+Selection precedence for model (first hit wins):
 
 1. ``OPENAI_IMAGE_MODEL`` env var (escape hatch for scripts / tests)
 2. ``image_gen.openai.model`` in ``config.yaml``
-3. ``image_gen.model`` in ``config.yaml`` (when it's one of our tier IDs)
-4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
+3. ``image_gen.model`` in ``config.yaml``
+4. :data:`DEFAULT_MODEL` — ``gpt-image-2``
+
+Quality resolution (only when model is ``gpt-image-2``):
+
+1. Tool arg ``quality``
+2. ``image_gen.openai.quality`` in ``config.yaml``
+3. ``image_gen.quality`` in ``config.yaml``
+4. :data:`DEFAULT_QUALITY` — ``medium``
 """
 
 from __future__ import annotations
@@ -44,35 +41,19 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Model catalog
 # ---------------------------------------------------------------------------
-#
-# All three IDs resolve to the same underlying API model with a different
-# ``quality`` setting. ``api_model`` is what gets sent to OpenAI;
-# ``quality`` is the knob that changes generation time and output fidelity.
 
 API_MODEL = "gpt-image-2"
+VALID_QUALITIES = {"low", "medium", "high"}
+DEFAULT_MODEL = API_MODEL
+DEFAULT_QUALITY = "medium"
 
-_MODELS: Dict[str, Dict[str, Any]] = {
-    "gpt-image-2-low": {
-        "display": "GPT Image 2 (Low)",
-        "speed": "~15s",
-        "strengths": "Fast iteration, lowest cost",
-        "quality": "low",
-    },
-    "gpt-image-2-medium": {
-        "display": "GPT Image 2 (Medium)",
-        "speed": "~40s",
-        "strengths": "Balanced — default",
-        "quality": "medium",
-    },
-    "gpt-image-2-high": {
-        "display": "GPT Image 2 (High)",
-        "speed": "~2min",
-        "strengths": "Highest fidelity, strongest prompt adherence",
-        "quality": "high",
-    },
+_MODEL_META: Dict[str, Dict[str, Any]] = {
+    API_MODEL: {
+        "display": "GPT Image 2",
+        "speed": "varies",
+        "strengths": "General image generation with optional quality tuning",
+    }
 }
-
-DEFAULT_MODEL = "gpt-image-2-medium"
 
 _SIZES = {
     "landscape": "1536x1024",
@@ -94,28 +75,59 @@ def _load_openai_config() -> Dict[str, Any]:
         return {}
 
 
-def _resolve_model() -> Tuple[str, Dict[str, Any]]:
-    """Decide which tier to use and return ``(model_id, meta)``."""
-    env_override = os.environ.get("OPENAI_IMAGE_MODEL")
-    if env_override and env_override in _MODELS:
-        return env_override, _MODELS[env_override]
+def _resolve_model(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve model id with minimal validation.
 
-    cfg = _load_openai_config()
+    Any non-empty string is accepted so advanced users can try unreleased or
+    proxy-specific model IDs.
+    """
+    env_override = os.environ.get("OPENAI_IMAGE_MODEL")
+    if isinstance(env_override, str) and env_override.strip():
+        return env_override.strip()
+
+    cfg = cfg or _load_openai_config()
     openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
-    candidate: Optional[str] = None
     if isinstance(openai_cfg, dict):
         value = openai_cfg.get("model")
-        if isinstance(value, str) and value in _MODELS:
-            candidate = value
-    if candidate is None:
-        top = cfg.get("model")
-        if isinstance(top, str) and top in _MODELS:
-            candidate = top
+        if isinstance(value, str) and value.strip():
+            return value.strip()
 
-    if candidate is not None:
-        return candidate, _MODELS[candidate]
+    top = cfg.get("model")
+    if isinstance(top, str) and top.strip():
+        return top.strip()
 
-    return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
+    return DEFAULT_MODEL
+
+
+def _resolve_quality(
+    cfg: Dict[str, Any],
+    *,
+    model: str,
+    override: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve quality for gpt-image-2; reject quality usage on other models."""
+    openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
+
+    raw: Any = override
+    if raw is None and isinstance(openai_cfg, dict):
+        raw = openai_cfg.get("quality")
+    if raw is None:
+        raw = cfg.get("quality")
+
+    if raw is None:
+        return (DEFAULT_QUALITY if model == API_MODEL else None), None
+
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "quality must be one of: low, medium, high"
+
+    quality = raw.strip().lower()
+    if quality not in VALID_QUALITIES:
+        return None, "quality must be one of: low, medium, high"
+
+    if model != API_MODEL:
+        return None, "quality is only supported when model is 'gpt-image-2'"
+
+    return quality, None
 
 
 def _normalize_local_attachments(value: Any) -> Tuple[List[Path], Optional[str]]:
@@ -180,7 +192,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 "strengths": meta["strengths"],
                 "price": "varies",
             }
-            for model_id, meta in _MODELS.items()
+            for model_id, meta in _MODEL_META.items()
         ]
 
     def default_model(self) -> Optional[str]:
@@ -190,7 +202,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
         return {
             "name": "OpenAI",
             "badge": "paid",
-            "tag": "gpt-image-2 at low/medium/high quality tiers",
+            "tag": "gpt-image-2 with optional low/medium/high quality",
             "env_vars": [
                 {
                     "key": "OPENAI_API_KEY",
@@ -248,7 +260,23 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        tier_id, meta = _resolve_model()
+        cfg = _load_openai_config()
+        model_id = _resolve_model(cfg)
+        quality, quality_err = _resolve_quality(
+            cfg,
+            model=model_id,
+            override=kwargs.get("quality"),
+        )
+        if quality_err:
+            return error_response(
+                error=quality_err,
+                error_type="invalid_argument",
+                provider="openai",
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
+
         size = _SIZES.get(aspect, _SIZES["square"])
 
         try:
@@ -256,31 +284,35 @@ class OpenAIImageGenProvider(ImageGenProvider):
             if attachments:
                 with ExitStack() as stack:
                     images = [stack.enter_context(path.open("rb")) for path in attachments]
-                    response = client.images.edit(
-                        model=API_MODEL,
-                        image=images,
-                        prompt=prompt,
-                        size=size,
-                        n=1,
-                        quality=meta["quality"],
-                    )
+                    payload: Dict[str, Any] = {
+                        "model": model_id,
+                        "image": images,
+                        "prompt": prompt,
+                        "size": size,
+                        "n": 1,
+                    }
+                    if quality is not None:
+                        payload["quality"] = quality
+                    response = client.images.edit(**payload)
             else:
                 # gpt-image-2 returns b64_json unconditionally and REJECTS
                 # ``response_format`` as an unknown parameter. Don't send it.
-                response = client.images.generate(
-                    model=API_MODEL,
-                    prompt=prompt,
-                    size=size,
-                    n=1,
-                    quality=meta["quality"],
-                )
+                payload = {
+                    "model": model_id,
+                    "prompt": prompt,
+                    "size": size,
+                    "n": 1,
+                }
+                if quality is not None:
+                    payload["quality"] = quality
+                response = client.images.generate(**payload)
         except Exception as exc:
             logger.debug("OpenAI image generation failed", exc_info=True)
             return error_response(
                 error=f"OpenAI image generation failed: {exc}",
                 error_type="api_error",
                 provider="openai",
-                model=tier_id,
+                model=model_id,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
@@ -291,7 +323,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 error="OpenAI returned no image data",
                 error_type="empty_response",
                 provider="openai",
-                model=tier_id,
+                model=model_id,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
@@ -303,13 +335,13 @@ class OpenAIImageGenProvider(ImageGenProvider):
 
         if b64:
             try:
-                saved_path = save_b64_image(b64, prefix=f"openai_{tier_id}")
+                saved_path = save_b64_image(b64, prefix=f"openai_{model_id}")
             except Exception as exc:
                 return error_response(
                     error=f"Could not save image to cache: {exc}",
                     error_type="io_error",
                     provider="openai",
-                    model=tier_id,
+                    model=model_id,
                     prompt=prompt,
                     aspect_ratio=aspect,
                 )
@@ -323,18 +355,20 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 error="OpenAI response contained neither b64_json nor URL",
                 error_type="empty_response",
                 provider="openai",
-                model=tier_id,
+                model=model_id,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
 
-        extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        extra: Dict[str, Any] = {"size": size}
+        if quality is not None:
+            extra["quality"] = quality
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
 
         return success_response(
             image=image_ref,
-            model=tier_id,
+            model=model_id,
             prompt=prompt,
             aspect_ratio=aspect,
             provider="openai",

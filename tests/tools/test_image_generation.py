@@ -421,18 +421,26 @@ class TestImageGenerateToolCompatibility:
 
 class TestRegistryIntegration:
 
-    def test_schema_exposes_prompt_aspect_ratio_and_attachments(self, image_tool):
-        """The agent-facing schema stays tight: generation prompt + ratio, plus
-        optional local reference images for edit-style generations."""
+    def test_schema_exposes_prompt_aspect_ratio_attachments_and_quality(self, image_tool):
+        """The agent-facing schema includes editing refs plus optional quality
+        override for GPT Image 2 providers."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
-        assert set(props.keys()) == {"prompt", "aspect_ratio", "attachments"}
+        assert set(props.keys()) == {"prompt", "aspect_ratio", "attachments", "quality"}
         attachments_desc = props["attachments"]["description"].lower()
         assert "local" in attachments_desc
         assert "path" in attachments_desc
+        assert props["quality"]["enum"] == ["low", "medium", "high"]
+        quality_desc = props["quality"]["description"].lower()
+        assert "gpt image 2" in quality_desc
+        assert "ignored" not in quality_desc
 
     def test_aspect_ratio_enum_is_three_values(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
         assert set(enum) == {"landscape", "square", "portrait"}
+
+    def test_invalid_quality_is_rejected_by_handler(self, image_tool):
+        response = image_tool._handle_image_generate({"prompt": "a cat", "quality": "ultra"})
+        assert "quality must be one of: low, medium, high" in response
 
 
 # ---------------------------------------------------------------------------

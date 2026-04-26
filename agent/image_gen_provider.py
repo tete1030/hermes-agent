@@ -32,6 +32,7 @@ import abc
 import base64
 import datetime
 import logging
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -171,6 +172,18 @@ def _images_cache_dir() -> Path:
     return path
 
 
+def _sanitize_filename_component(value: Any, *, fallback: str) -> str:
+    """Return a filesystem-safe filename component.
+
+    Keeps alphanumerics plus ``._-`` and collapses everything else to ``_``.
+    """
+    if not isinstance(value, str):
+        return fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or fallback
+
+
 def save_b64_image(
     b64_data: str,
     *,
@@ -186,7 +199,9 @@ def save_b64_image(
     raw = base64.b64decode(b64_data)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
-    path = _images_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
+    safe_prefix = _sanitize_filename_component(prefix, fallback="image")
+    safe_extension = _sanitize_filename_component(extension, fallback="png")
+    path = _images_cache_dir() / f"{safe_prefix}_{ts}_{short}.{safe_extension}"
     path.write_bytes(raw)
     return path
 

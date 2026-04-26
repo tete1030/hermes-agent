@@ -76,11 +76,11 @@ class TestMetadata:
         assert provider.display_name == "OpenAI (Codex auth)"
 
     def test_default_model(self, provider):
-        assert provider.default_model() == "gpt-image-2-medium"
+        assert provider.default_model() == "gpt-image-2"
 
-    def test_list_models_three_tiers(self, provider):
+    def test_list_models_contains_base_model(self, provider):
         ids = [m["id"] for m in provider.list_models()]
-        assert ids == ["gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"]
+        assert ids == ["gpt-image-2"]
 
     def test_setup_schema_has_no_required_env_vars(self, provider):
         schema = provider.get_setup_schema()
@@ -132,6 +132,18 @@ class TestAvailability:
         fake_openai = SimpleNamespace()
         with patch.dict("sys.modules", {"openai": fake_openai}):
             assert codex_plugin.OpenAICodexImageGenProvider().is_available() is True
+
+
+# ── Model resolution ────────────────────────────────────────────────────────
+
+
+class TestModelResolution:
+    def test_default_model_is_gpt_image_2(self):
+        assert codex_plugin._resolve_model() == "gpt-image-2"
+
+    def test_env_var_override_accepts_any_model_string(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "custom-image-model")
+        assert codex_plugin._resolve_model() == "custom-image-model"
 
 
 # ── Generate ────────────────────────────────────────────────────────────────
@@ -241,7 +253,7 @@ class TestGenerate:
         result = provider.generate("a cat", aspect_ratio="landscape")
 
         assert result["success"] is True
-        assert result["model"] == "gpt-image-2-medium"
+        assert result["model"] == "gpt-image-2"
         assert result["provider"] == "openai-codex"
         assert result["quality"] == "medium"
 
@@ -292,6 +304,51 @@ class TestGenerate:
         assert tool["output_format"] == "png"
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1
+
+    def test_quality_override_applies_to_gpt_image_2(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        captured = {}
+
+        def _stream(**kwargs):
+            captured.update(kwargs)
+            output_item = SimpleNamespace(
+                type="image_generation_call",
+                status="generating",
+                id="ig_test",
+                result=_b64_png(),
+            )
+            done_event = SimpleNamespace(type="response.output_item.done", item=output_item)
+            final_response = SimpleNamespace(output=[], status="completed", output_text="")
+            return _FakeStream([done_event], final_response)
+
+        fake_client = SimpleNamespace(responses=SimpleNamespace(stream=_stream))
+        monkeypatch.setattr(codex_plugin, "_build_codex_client", lambda: fake_client)
+
+        result = provider.generate("a cat", quality="high")
+
+        assert result["success"] is True
+        assert result["quality"] == "high"
+        assert captured["tools"][0]["quality"] == "high"
+
+    def test_quality_with_non_gpt_image_2_model_is_rejected(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "custom-image-model")
+
+        result = provider.generate("a cat", quality="high")
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+        assert "quality is only supported when model is 'gpt-image-2'" in result["error"]
+
+    def test_invalid_quality_is_rejected(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        result = provider.generate("a cat", quality="ultra")
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+        assert "quality must be one of: low, medium, high" in result["error"]
 
     def test_partial_image_event_used_when_done_missing(self, provider, monkeypatch):
         """If the stream never emits output_item.done, fall back to the

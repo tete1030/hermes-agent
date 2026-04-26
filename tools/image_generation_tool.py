@@ -662,6 +662,7 @@ def image_generate_tool(
     output_format: Optional[str] = None,
     seed: Optional[int] = None,
     attachments: Optional[list[str]] = None,
+    quality: Optional[str] = None,
 ) -> str:
     """Generate an image from a text prompt using the configured FAL model.
 
@@ -682,6 +683,7 @@ def image_generate_tool(
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
             "attachments": attachments or [],
+            "quality": quality,
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
             "num_images": num_images,
@@ -705,6 +707,13 @@ def image_generate_tool(
                 "Configured FAL backend is text-to-image only and does not support "
                 "attachments. Set image_gen.provider to openai/openai-codex to use "
                 "reference images."
+            )
+
+        if quality is not None:
+            raise ValueError(
+                "Configured FAL backend does not support quality overrides. "
+                "quality is only supported when image_gen.provider is "
+                "openai/openai-codex and model is gpt-image-2."
             )
 
         if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
@@ -966,6 +975,14 @@ IMAGE_GENERATE_SCHEMA = {
                     "Entries must be local image file paths."
                 ),
             },
+            "quality": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": (
+                    "Optional quality override for GPT Image 2 providers only. "
+                    "Unsupported providers reject this parameter."
+                ),
+            },
         },
         "required": ["prompt"],
     },
@@ -1012,6 +1029,7 @@ def _dispatch_to_plugin_provider(
     prompt: str,
     aspect_ratio: str,
     attachments: Optional[list[str]] = None,
+    quality: Optional[str] = None,
 ):
     """Route the call to a plugin-registered provider when one is selected.
 
@@ -1069,6 +1087,7 @@ def _dispatch_to_plugin_provider(
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
             "attachments": attachments or [],
+            "quality": quality,
         }
         if configured_model:
             kwargs["model"] = configured_model
@@ -1105,9 +1124,22 @@ def _handle_image_generate(args, **kw):
     if not isinstance(attachments, list) or any(not isinstance(v, str) for v in attachments):
         return tool_error("attachments must be an array of strings")
 
+    quality = args.get("quality")
+    if quality is not None:
+        if not isinstance(quality, str):
+            return tool_error("quality must be one of: low, medium, high")
+        quality = quality.strip().lower()
+        if quality not in {"low", "medium", "high"}:
+            return tool_error("quality must be one of: low, medium, high")
+
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, attachments=attachments)
+    dispatched = _dispatch_to_plugin_provider(
+        prompt,
+        aspect_ratio,
+        attachments=attachments,
+        quality=quality,
+    )
     if dispatched is not None:
         return dispatched
 
@@ -1115,6 +1147,7 @@ def _handle_image_generate(args, **kw):
         prompt=prompt,
         aspect_ratio=aspect_ratio,
         attachments=attachments,
+        quality=quality,
     )
 
 

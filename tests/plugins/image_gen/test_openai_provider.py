@@ -1,4 +1,4 @@
-"""Tests for the bundled OpenAI image_gen plugin (gpt-image-2, three tiers)."""
+"""Tests for the bundled OpenAI image_gen plugin (gpt-image-2 + quality)."""
 
 from __future__ import annotations
 
@@ -55,11 +55,11 @@ class TestMetadata:
         assert provider.name == "openai"
 
     def test_default_model(self, provider):
-        assert provider.default_model() == "gpt-image-2-medium"
+        assert provider.default_model() == "gpt-image-2"
 
-    def test_list_models_three_tiers(self, provider):
+    def test_list_models_contains_base_model(self, provider):
         ids = [m["id"] for m in provider.list_models()]
-        assert ids == ["gpt-image-2-low", "gpt-image-2-medium", "gpt-image-2-high"]
+        assert ids == ["gpt-image-2"]
 
     def test_catalog_entries_have_display_speed_strengths(self, provider):
         for entry in provider.list_models():
@@ -85,40 +85,32 @@ class TestAvailability:
 
 
 class TestModelResolution:
-    def test_default_is_medium(self):
-        model_id, meta = openai_plugin._resolve_model()
-        assert model_id == "gpt-image-2-medium"
-        assert meta["quality"] == "medium"
+    def test_default_model_is_gpt_image_2(self):
+        model_id = openai_plugin._resolve_model()
+        assert model_id == "gpt-image-2"
 
-    def test_env_var_override(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-2-high")
-        model_id, meta = openai_plugin._resolve_model()
-        assert model_id == "gpt-image-2-high"
-        assert meta["quality"] == "high"
-
-    def test_env_var_unknown_falls_back(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "bogus-tier")
-        model_id, _ = openai_plugin._resolve_model()
-        assert model_id == openai_plugin.DEFAULT_MODEL
+    def test_env_var_override_accepts_any_model_string(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "my-custom-model")
+        model_id = openai_plugin._resolve_model()
+        assert model_id == "my-custom-model"
 
     def test_config_openai_model(self, tmp_path):
         import yaml
+
         (tmp_path / "config.yaml").write_text(
-            yaml.safe_dump({"image_gen": {"openai": {"model": "gpt-image-2-low"}}})
+            yaml.safe_dump({"image_gen": {"openai": {"model": "gpt-image-2"}}})
         )
-        model_id, meta = openai_plugin._resolve_model()
-        assert model_id == "gpt-image-2-low"
-        assert meta["quality"] == "low"
+        model_id = openai_plugin._resolve_model()
+        assert model_id == "gpt-image-2"
 
     def test_config_top_level_model(self, tmp_path):
-        """``image_gen.model: gpt-image-2-high`` also works (top-level)."""
         import yaml
+
         (tmp_path / "config.yaml").write_text(
-            yaml.safe_dump({"image_gen": {"model": "gpt-image-2-high"}})
+            yaml.safe_dump({"image_gen": {"model": "custom-image-model"}})
         )
-        model_id, meta = openai_plugin._resolve_model()
-        assert model_id == "gpt-image-2-high"
-        assert meta["quality"] == "high"
+        model_id = openai_plugin._resolve_model()
+        assert model_id == "custom-image-model"
 
 
 # ── Generate ────────────────────────────────────────────────────────────────
@@ -146,7 +138,7 @@ class TestGenerate:
             result = provider.generate("a cat", aspect_ratio="landscape")
 
         assert result["success"] is True
-        assert result["model"] == "gpt-image-2-medium"
+        assert result["model"] == "gpt-image-2"
         assert result["aspect_ratio"] == "landscape"
         assert result["provider"] == "openai"
         assert result["quality"] == "medium"
@@ -164,24 +156,48 @@ class TestGenerate:
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
-    @pytest.mark.parametrize("tier,expected_quality", [
-        ("gpt-image-2-low", "low"),
-        ("gpt-image-2-medium", "medium"),
-        ("gpt-image-2-high", "high"),
-    ])
-    def test_tier_maps_to_quality(self, provider, monkeypatch, tier, expected_quality):
-        monkeypatch.setenv("OPENAI_IMAGE_MODEL", tier)
+    def test_quality_override_applies_to_gpt_image_2(self, provider):
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a cat", quality="high")
+
+        assert result["model"] == "gpt-image-2"
+        assert result["quality"] == "high"
+        assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
+        assert fake_client.images.generate.call_args.kwargs["quality"] == "high"
+
+    def test_config_quality_default_applies_for_gpt_image_2(self, provider, tmp_path):
+        import yaml
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"image_gen": {"openai": {"model": "gpt-image-2", "quality": "low"}}})
+        )
+
         fake_client = MagicMock()
         fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
 
         with _patched_openai(fake_client):
             result = provider.generate("a cat")
 
-        assert result["model"] == tier
-        assert result["quality"] == expected_quality
-        assert fake_client.images.generate.call_args.kwargs["quality"] == expected_quality
-        # Always the same underlying API model regardless of tier.
-        assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
+        assert result["quality"] == "low"
+        assert fake_client.images.generate.call_args.kwargs["quality"] == "low"
+
+    def test_quality_with_non_gpt_image_2_model_is_rejected(self, provider, monkeypatch):
+        monkeypatch.setenv("OPENAI_IMAGE_MODEL", "custom-model")
+        result = provider.generate("a cat", quality="high")
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+        assert "quality is only supported when model is 'gpt-image-2'" in result["error"]
+
+    def test_invalid_quality_is_rejected(self, provider):
+        result = provider.generate("a cat", quality="ultra")
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+        assert "quality must be one of: low, medium, high" in result["error"]
 
     @pytest.mark.parametrize("aspect,expected_size", [
         ("landscape", "1536x1024"),

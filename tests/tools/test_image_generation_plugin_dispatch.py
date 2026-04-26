@@ -28,6 +28,7 @@ class _FakeCodexProvider(ImageGenProvider):
             "aspect_ratio": aspect_ratio,
             "provider": "codex",
             "attachments": kwargs.get("attachments", []),
+            "quality": kwargs.get("quality"),
         }
 
 
@@ -53,7 +54,7 @@ class TestPluginDispatch:
         assert payload["image"] == "/tmp/codex-test.png"
         assert payload["aspect_ratio"] == "square"
 
-    def test_dispatch_forwards_attachments_to_provider(self, monkeypatch, tmp_path):
+    def test_dispatch_forwards_attachments_and_quality_to_provider(self, monkeypatch, tmp_path):
         from tools import image_generation_tool
         from agent import image_gen_registry as registry_module
         from hermes_cli import plugins as plugins_module
@@ -69,11 +70,13 @@ class TestPluginDispatch:
             "draw cat",
             "square",
             attachments=["/tmp/cat.png", "/tmp/ref.png"],
+            quality="high",
         )
         payload = json.loads(dispatched)
 
         assert payload["success"] is True
         assert payload["attachments"] == ["/tmp/cat.png", "/tmp/ref.png"]
+        assert payload["quality"] == "high"
 
     def test_dispatch_reports_missing_registered_provider(self, monkeypatch, tmp_path):
         from tools import image_generation_tool

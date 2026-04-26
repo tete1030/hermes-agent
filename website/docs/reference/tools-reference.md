@@ -114,7 +114,7 @@ Scoped to the Feishu document-comment handler. Drives comment read/write operati
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `image_generate` | Generate high-quality images from text prompts. Supports optional local reference-image attachments (`attachments`) for providers that implement image-edit flows (currently OpenAI/OpenAI-Codex). The active backend/model is user-configured and not selectable by the agent. Returns a URL or absolute file path in `image`. | FAL_KEY (or provider-specific auth) |
+| `image_generate` | Generate high-quality images from text prompts. Supports optional local reference-image attachments (`attachments`) for providers that implement image-edit flows (currently OpenAI/OpenAI-Codex). Also supports optional `quality` (`low`/`medium`/`high`) when the active provider model is `gpt-image-2`. The active backend/model is user-configured and not selectable by the agent. Returns a URL or absolute file path in `image`. | FAL_KEY (or provider-specific auth) |
 
 ## `kanban` toolset
 
