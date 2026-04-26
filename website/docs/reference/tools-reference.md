@@ -114,7 +114,7 @@ Scoped to the Feishu document-comment handler. Drives comment read/write operati
 
 | Tool | Description | Requires environment |
 |------|-------------|----------------------|
-| `image_generate` | Generate high-quality images from text prompts using FAL.ai. The underlying model is user-configured (default: FLUX 2 Klein 9B, sub-1s generation) and is not selectable by the agent. Returns a single image URL. Display it using… | FAL_KEY |
+| `image_generate` | Generate high-quality images from text prompts. Supports optional local reference-image attachments (`attachments`) for providers that implement image-edit flows (currently OpenAI/OpenAI-Codex). The active backend/model is user-configured and not selectable by the agent. Returns a URL or absolute file path in `image`. | FAL_KEY (or provider-specific auth) |
 
 ## `kanban` toolset
 

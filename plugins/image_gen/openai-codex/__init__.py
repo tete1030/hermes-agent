@@ -19,8 +19,11 @@ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
 
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -214,9 +217,63 @@ def _build_codex_client():
         return None
 
 
-def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> Optional[str]:
+def _normalize_local_attachments(value: Any) -> Tuple[List[Path], Optional[str]]:
+    """Validate Codex attachments and keep the local-path-only contract in one place."""
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], "attachments must be an array of strings"
+
+    normalized: List[Path] = []
+    for idx, raw in enumerate(value, start=1):
+        if not isinstance(raw, str) or not raw.strip():
+            return [], f"attachments[{idx}] must be a non-empty string"
+
+        ref = raw.strip()
+        lowered = ref.lower()
+        if lowered.startswith("http://") or lowered.startswith("https://") or lowered.startswith("data:image/"):
+            return [], "OpenAI-Codex provider only accepts local file path attachments"
+
+        path = Path(ref).expanduser()
+        if not path.is_file():
+            return [], f"Attachment not found: {ref}"
+
+        mime, _ = mimetypes.guess_type(str(path))
+        if not mime or not mime.startswith("image/"):
+            return [], f"Attachment is not an image file: {ref}"
+
+        normalized.append(path)
+
+    return normalized, None
+
+
+def _attachment_to_input_image_url(path: Path) -> str:
+    """Convert a validated local image path into a data URL for Responses input."""
+    mime, _ = mimetypes.guess_type(str(path))
+    # Attachment MIME was validated in _normalize_local_attachments.
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _build_responses_input_content(prompt: str, attachments: List[Path]) -> List[Dict[str, Any]]:
+    """Build Responses input content with text + optional input_image parts."""
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    for path in attachments:
+        content.append({"type": "input_image", "image_url": _attachment_to_input_image_url(path)})
+    return content
+
+
+def _collect_image_b64(
+    client: Any,
+    *,
+    prompt: str,
+    size: str,
+    quality: str,
+    attachments: Optional[List[Path]] = None,
+) -> Optional[str]:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     image_b64: Optional[str] = None
+    content = _build_responses_input_content(prompt, attachments or [])
 
     with client.responses.stream(
         model=_CODEX_CHAT_MODEL,
@@ -225,7 +282,7 @@ def _collect_image_b64(client: Any, *, prompt: str, size: str, quality: str) -> 
         input=[{
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
+            "content": content,
         }],
         tools=[{
             "type": "image_generation",
@@ -337,6 +394,15 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
+        attachments, attachment_err = _normalize_local_attachments(kwargs.get("attachments"))
+        if attachment_err:
+            return error_response(
+                error=attachment_err,
+                error_type="invalid_argument",
+                provider="openai-codex",
+                aspect_ratio=aspect,
+            )
+
         settings = _resolve_endpoint_auth()
         if not settings.get("api_key"):
             if settings.get("mode") == "custom_endpoint":
@@ -387,6 +453,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 prompt=prompt,
                 size=size,
                 quality=meta["quality"],
+                attachments=attachments,
             )
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)

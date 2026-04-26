@@ -208,6 +208,32 @@ class TestGenerate:
 
         assert result["revised_prompt"] == "A photo of a cat"
 
+    def test_attachments_use_images_edit(self, provider, tmp_path):
+        ref = tmp_path / "ref.png"
+        ref.write_bytes(bytes.fromhex(_PNG_HEX))
+
+        fake_client = MagicMock()
+        fake_client.images.edit.return_value = _fake_response(b64=_b64_png())
+
+        with _patched_openai(fake_client):
+            result = provider.generate("a cat", attachments=[str(ref)])
+
+        assert result["success"] is True
+        fake_client.images.edit.assert_called_once()
+        fake_client.images.generate.assert_not_called()
+        edit_kwargs = fake_client.images.edit.call_args.kwargs
+        assert edit_kwargs["model"] == "gpt-image-2"
+        assert edit_kwargs["quality"] == "medium"
+        assert isinstance(edit_kwargs["image"], list)
+        assert len(edit_kwargs["image"]) == 1
+
+    def test_non_local_attachment_is_rejected(self, provider):
+        result = provider.generate("a cat", attachments=["https://example.com/ref.png"])
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+        assert result["error"] == "OpenAI provider only accepts local file path attachments"
+
     def test_api_error_returns_error_response(self, provider):
         fake_client = MagicMock()
         fake_client.images.generate.side_effect = RuntimeError("boom")

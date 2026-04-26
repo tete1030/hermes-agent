@@ -661,13 +661,15 @@ def image_generate_tool(
     num_images: Optional[int] = None,
     output_format: Optional[str] = None,
     seed: Optional[int] = None,
+    attachments: Optional[list[str]] = None,
 ) -> str:
     """Generate an image from a text prompt using the configured FAL model.
 
-    The agent-facing schema exposes only ``prompt`` and ``aspect_ratio``; the
-    remaining kwargs are overrides for direct Python callers and are filtered
-    per-model via the ``supports`` whitelist (unsupported overrides are
-    silently dropped so legacy callers don't break when switching models).
+    The agent-facing schema exposes ``prompt``, ``aspect_ratio``, and optional
+    ``attachments``. Remaining kwargs are overrides for direct Python callers
+    and are filtered per-model via the ``supports`` whitelist (unsupported
+    overrides are silently dropped so legacy callers don't break when
+    switching models).
 
     Returns a JSON string with ``{"success": bool, "image": url | None,
     "error": str, "error_type": str}``.
@@ -679,6 +681,7 @@ def image_generate_tool(
         "parameters": {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
+            "attachments": attachments or [],
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
             "num_images": num_images,
@@ -696,6 +699,13 @@ def image_generate_tool(
     try:
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
+
+        if attachments:
+            raise ValueError(
+                "Configured FAL backend is text-to-image only and does not support "
+                "attachments. Set image_gen.provider to openai/openai-codex to use "
+                "reference images."
+            )
 
         if not (fal_key_is_configured() or _resolve_managed_fal_gateway()):
             raise ValueError(_build_no_backend_setup_message())
@@ -948,6 +958,14 @@ IMAGE_GENERATE_SCHEMA = {
                 "description": "The aspect ratio of the generated image. 'landscape' is 16:9 wide, 'portrait' is 16:9 tall, 'square' is 1:1.",
                 "default": DEFAULT_ASPECT_RATIO,
             },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional reference images for image-edit style generation. "
+                    "Entries must be local image file paths."
+                ),
+            },
         },
         "required": ["prompt"],
     },
@@ -990,7 +1008,11 @@ def _read_configured_image_provider():
     return None
 
 
-def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
+def _dispatch_to_plugin_provider(
+    prompt: str,
+    aspect_ratio: str,
+    attachments: Optional[list[str]] = None,
+):
     """Route the call to a plugin-registered provider when one is selected.
 
     Returns a JSON string on dispatch, or ``None`` to fall through to the
@@ -1043,7 +1065,11 @@ def _dispatch_to_plugin_provider(prompt: str, aspect_ratio: str):
         })
 
     try:
-        kwargs = {"prompt": prompt, "aspect_ratio": aspect_ratio}
+        kwargs = {
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "attachments": attachments or [],
+        }
         if configured_model:
             kwargs["model"] = configured_model
         result = provider.generate(**kwargs)
@@ -1073,16 +1099,22 @@ def _handle_image_generate(args, **kw):
     if not prompt:
         return tool_error("prompt is required for image generation")
     aspect_ratio = args.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    attachments = args.get("attachments", [])
+    if attachments is None:
+        attachments = []
+    if not isinstance(attachments, list) or any(not isinstance(v, str) for v in attachments):
+        return tool_error("attachments must be an array of strings")
 
     # Route to a plugin-registered provider if one is active (and it's
     # not the in-tree FAL path).
-    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio)
+    dispatched = _dispatch_to_plugin_provider(prompt, aspect_ratio, attachments=attachments)
     if dispatched is not None:
         return dispatched
 
     return image_generate_tool(
         prompt=prompt,
         aspect_ratio=aspect_ratio,
+        attachments=attachments,
     )
 
 

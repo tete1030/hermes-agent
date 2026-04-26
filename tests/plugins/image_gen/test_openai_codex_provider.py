@@ -315,6 +315,63 @@ class TestGenerate:
         assert result["success"] is True
         assert Path(result["image"]).exists()
 
+    def test_attachments_are_encoded_into_input_images(self, provider, monkeypatch, tmp_path):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        local_ref = tmp_path / "reference.png"
+        local_ref.write_bytes(bytes.fromhex(_PNG_HEX))
+
+        captured = {}
+
+        def _stream(**kwargs):
+            captured.update(kwargs)
+            output_item = SimpleNamespace(
+                type="image_generation_call",
+                status="generating",
+                id="ig_test",
+                result=_b64_png(),
+            )
+            done_event = SimpleNamespace(type="response.output_item.done", item=output_item)
+            final_response = SimpleNamespace(output=[], status="completed", output_text="")
+            return _FakeStream([done_event], final_response)
+
+        fake_client = SimpleNamespace(responses=SimpleNamespace(stream=_stream))
+        monkeypatch.setattr(codex_plugin, "_build_codex_client", lambda: fake_client)
+
+        result = provider.generate(
+            "a cat",
+            attachments=[str(local_ref)],
+        )
+
+        assert result["success"] is True
+        content = captured["input"][0]["content"]
+        image_parts = [part for part in content if part.get("type") == "input_image"]
+        assert len(image_parts) == 1
+        assert image_parts[0]["image_url"].startswith("data:image/png;base64,")
+
+    def test_non_local_attachment_returns_invalid_argument(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        result = provider.generate(
+            "a cat",
+            attachments=["https://example.com/ref.png"],
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+        assert result["error"] == "OpenAI-Codex provider only accepts local file path attachments"
+
+    def test_missing_local_attachment_returns_invalid_argument(self, provider, monkeypatch):
+        monkeypatch.setattr(codex_plugin, "_read_codex_access_token", lambda: "codex-token")
+
+        result = provider.generate(
+            "a cat",
+            attachments=["/tmp/definitely-missing-image.png"],
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_argument"
+
     def test_final_response_sweep_recovers_image(self, provider, monkeypatch):
         """If no image_generation_call event arrives mid-stream, the
         post-stream final-response sweep should still find the image."""

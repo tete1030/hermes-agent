@@ -23,8 +23,10 @@ Selection precedence (first hit wins):
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -116,6 +118,34 @@ def _resolve_model() -> Tuple[str, Dict[str, Any]]:
     return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
 
 
+def _normalize_local_attachments(value: Any) -> Tuple[List[Path], Optional[str]]:
+    """Validate attachment inputs for OpenAI images.edit().
+
+    OpenAI's edit endpoint expects image files, so this provider accepts
+    local file paths only.
+    """
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], "attachments must be an array of strings"
+
+    paths: List[Path] = []
+    for idx, raw in enumerate(value, start=1):
+        if not isinstance(raw, str) or not raw.strip():
+            return [], f"attachments[{idx}] must be a non-empty string"
+        ref = raw.strip()
+        lowered = ref.lower()
+        if lowered.startswith("http://") or lowered.startswith("https://") or lowered.startswith("data:image/"):
+            return [], "OpenAI provider only accepts local file path attachments"
+
+        path = Path(ref).expanduser()
+        if not path.is_file():
+            return [], f"Attachment not found: {ref}"
+        paths.append(path)
+
+    return paths, None
+
+
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -187,6 +217,15 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
+        attachments, attachment_err = _normalize_local_attachments(kwargs.get("attachments"))
+        if attachment_err:
+            return error_response(
+                error=attachment_err,
+                error_type="invalid_argument",
+                provider="openai",
+                aspect_ratio=aspect,
+            )
+
         if not os.environ.get("OPENAI_API_KEY"):
             return error_response(
                 error=(
@@ -212,19 +251,29 @@ class OpenAIImageGenProvider(ImageGenProvider):
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
 
-        # gpt-image-2 returns b64_json unconditionally and REJECTS
-        # ``response_format`` as an unknown parameter. Don't send it.
-        payload: Dict[str, Any] = {
-            "model": API_MODEL,
-            "prompt": prompt,
-            "size": size,
-            "n": 1,
-            "quality": meta["quality"],
-        }
-
         try:
             client = openai.OpenAI()
-            response = client.images.generate(**payload)
+            if attachments:
+                with ExitStack() as stack:
+                    images = [stack.enter_context(path.open("rb")) for path in attachments]
+                    response = client.images.edit(
+                        model=API_MODEL,
+                        image=images,
+                        prompt=prompt,
+                        size=size,
+                        n=1,
+                        quality=meta["quality"],
+                    )
+            else:
+                # gpt-image-2 returns b64_json unconditionally and REJECTS
+                # ``response_format`` as an unknown parameter. Don't send it.
+                response = client.images.generate(
+                    model=API_MODEL,
+                    prompt=prompt,
+                    size=size,
+                    n=1,
+                    quality=meta["quality"],
+                )
         except Exception as exc:
             logger.debug("OpenAI image generation failed", exc_info=True)
             return error_response(

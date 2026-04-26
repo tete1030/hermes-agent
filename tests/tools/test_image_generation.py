@@ -9,6 +9,7 @@ tests/tools/test_managed_media_gateways.py.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -358,16 +359,76 @@ class TestAspectRatioNormalization:
 
 
 # ---------------------------------------------------------------------------
+# image_generate_tool compatibility
+# ---------------------------------------------------------------------------
+
+class TestImageGenerateToolCompatibility:
+
+    def test_positional_optional_args_keep_legacy_order(self, image_tool, monkeypatch):
+        """Direct Python callers historically passed optional args positionally.
+        Keep that call shape stable when adding new kwargs."""
+
+        model_id = "fal-ai/flux-2/klein/9b"
+        monkeypatch.setattr(
+            image_tool,
+            "_resolve_fal_model",
+            lambda: (model_id, image_tool.FAL_MODELS[model_id]),
+        )
+        monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway", lambda: object())
+
+        captured = {}
+
+        def _fake_build_fal_payload(mid, prompt, aspect, seed=None, overrides=None):
+            captured["model_id"] = mid
+            captured["aspect"] = aspect
+            captured["seed"] = seed
+            captured["overrides"] = dict(overrides or {})
+            return {"prompt": prompt}
+
+        class _Handler:
+            def get(self):
+                return {"images": [{"url": "https://example.com/image.png"}]}
+
+        monkeypatch.setattr(image_tool, "_build_fal_payload", _fake_build_fal_payload)
+        monkeypatch.setattr(image_tool, "_submit_fal_request", lambda *_args, **_kwargs: _Handler())
+
+        result = image_tool.image_generate_tool(
+            "a cat",
+            "square",
+            30,
+            7.0,
+            1,
+            "png",
+            42,
+        )
+        payload = json.loads(result)
+
+        assert payload["success"] is True
+        assert captured["model_id"] == model_id
+        assert captured["aspect"] == "square"
+        assert captured["seed"] == 42
+        assert captured["overrides"] == {
+            "num_inference_steps": 30,
+            "guidance_scale": 7.0,
+            "num_images": 1,
+            "output_format": "png",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Schema + registry integrity
 # ---------------------------------------------------------------------------
 
 class TestRegistryIntegration:
 
-    def test_schema_exposes_only_prompt_and_aspect_ratio_to_agent(self, image_tool):
-        """The agent-facing schema must stay tight — model selection is a
-        user-level config choice, not an agent-level arg."""
+    def test_schema_exposes_prompt_aspect_ratio_and_attachments(self, image_tool):
+        """The agent-facing schema stays tight: generation prompt + ratio, plus
+        optional local reference images for edit-style generations."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
-        assert set(props.keys()) == {"prompt", "aspect_ratio"}
+        assert set(props.keys()) == {"prompt", "aspect_ratio", "attachments"}
+        attachments_desc = props["attachments"]["description"].lower()
+        assert "local" in attachments_desc
+        assert "path" in attachments_desc
 
     def test_aspect_ratio_enum_is_three_values(self, image_tool):
         enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
