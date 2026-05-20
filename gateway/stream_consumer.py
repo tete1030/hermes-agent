@@ -766,7 +766,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    reply_to=self._message_id or self._initial_reply_to,
+                    reply_to=self._message_id or self._initial_reply_to_id,
                     metadata=self.metadata,
                 )
                 if result.success:
@@ -978,7 +978,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                reply_to=self._message_id or self._initial_reply_to,
+                reply_to=self._message_id or self._initial_reply_to_id,
                 metadata=self.metadata,
             )
             # Note: do NOT set _already_sent = True here.

@@ -4349,7 +4349,12 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
-        if not effective_reply_to and metadata and metadata.get("thread_id"):
+        if (
+            not effective_reply_to
+            and metadata
+            and metadata.get("thread_id")
+            and not metadata.get("_disable_root_reply_fallback")
+        ):
             effective_reply_to = (
                 metadata.get("reply_to_message_id")
                 or metadata.get("root_message_id")
@@ -4548,19 +4553,15 @@ class FeishuAdapter(BasePlatformAdapter):
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
-                        if (metadata or {}).get("thread_id"):
-                            logger.warning(
-                                "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
-                                "skipping top-level fallback to avoid creating a new topic",
-                                active_reply_to,
-                                (metadata or {}).get("thread_id"),
-                                code,
-                            )
-                            return response
                         logger.warning(
-                            "[Feishu] Reply to %s failed (code %s — message withdrawn/missing); "
+                            "[Feishu] Reply to %s failed%s (code %s — message withdrawn/missing); "
                             "falling back to new message in chat %s",
                             active_reply_to,
+                            (
+                                f" in thread {(metadata or {}).get('thread_id')}"
+                                if (metadata or {}).get("thread_id")
+                                else ""
+                            ),
                             code,
                             chat_id,
                         )

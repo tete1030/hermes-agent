@@ -12839,11 +12839,13 @@ class GatewayRunner:
             return None
         metadata: Dict[str, Any] = {"thread_id": thread_id}
         anchor = reply_to_message_id or getattr(source, "message_id", None)
-        if getattr(source, "platform", None) == Platform.FEISHU and anchor is not None:
+        platform = getattr(source, "platform", None)
+        chat_type = getattr(source, "chat_type", None)
+        if anchor is not None and not (platform == Platform.TELEGRAM and chat_type == "dm"):
             metadata["root_message_id"] = str(anchor)
         if (
-            getattr(source, "platform", None) == Platform.TELEGRAM
-            and getattr(source, "chat_type", None) == "dm"
+            platform == Platform.TELEGRAM
+            and chat_type == "dm"
         ):
             metadata["telegram_dm_topic_reply_fallback"] = True
             if anchor is not None:
@@ -14976,6 +14978,8 @@ class GatewayRunner:
             """Render one tool progress line for gateway transports."""
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
+            if tool_name == "skill_view":
+                emoji = "⚙️"
 
             if progress_mode == "verbose":
                 if args:
@@ -15092,7 +15096,10 @@ class GatewayRunner:
         _progress_metadata = (
             self._thread_metadata_for_source(source, event_message_id)
             if _progress_thread_id == source.thread_id
-            else {"thread_id": _progress_thread_id}
+            else {
+                "thread_id": _progress_thread_id,
+                **({"root_message_id": str(event_message_id)} if event_message_id else {}),
+            }
         ) if _progress_thread_id else None
         _progress_reply_to = (
             event_message_id
@@ -15398,12 +15405,14 @@ class GatewayRunner:
             # sent via the reply API with reply_in_thread=true. Status/interim,
             # approval, and stream-consumer paths usually only receive metadata,
             # so carry the triggering message id as a Feishu-specific fallback.
-            _status_thread_metadata: Optional[Dict[str, Any]] = {
-                "thread_id": _progress_thread_id,
-                "reply_to_message_id": event_message_id,
-            }
+            _status_thread_metadata = dict(
+                self._thread_metadata_for_source(source, event_message_id) or {}
+            )
+            if _progress_thread_id:
+                _status_thread_metadata["thread_id"] = _progress_thread_id
+            _status_thread_metadata["reply_to_message_id"] = event_message_id
         else:
-            _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+            _status_thread_metadata = _progress_metadata if _progress_thread_id else None
         _status_supports_edit = bool(
             _status_adapter
             and getattr(

@@ -9509,6 +9509,15 @@ class HermesCLI:
         if not confirm_required:
             return "once"
 
+        # Non-interactive contexts (tests, piping, batch wrappers) cannot answer
+        # the modal prompt. Fall back to one-shot approval so slash commands
+        # remain scriptable and unit tests don't hang on stdin.
+        try:
+            if not getattr(sys.stdin, "isatty", lambda: False)():
+                return "once"
+        except Exception:
+            return "once"
+
         # Render a prompt_toolkit-native confirmation panel.  This keeps option
         # labels visible above the composer and avoids raw input()/EOF races with
         # the running TUI.

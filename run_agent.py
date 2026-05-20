@@ -10969,9 +10969,10 @@ class AIAgent:
             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
             focus_topic,
         )
-        self._emit_status(
-            "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
-        )
+        if not emit_user_notice:
+            self._emit_status(
+                "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
+            )
 
         # Notify external memory provider before compression discards context
         if self._memory_manager:
@@ -11126,7 +11127,7 @@ class AIAgent:
         _compressed_est = estimate_request_tokens_rough(
             compressed,
             system_prompt=new_system_prompt or "",
-            tools=self.tools or None,
+            tools=getattr(self, "tools", None) or None,
         )
         self.context_compressor.last_prompt_tokens = _compressed_est
         self.context_compressor.last_completion_tokens = 0
